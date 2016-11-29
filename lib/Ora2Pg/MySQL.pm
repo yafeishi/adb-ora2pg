@@ -278,7 +278,7 @@ END
 	my %data = ();
 	my $pos = 0;
 	while (my $row = $sth->fetch) {
-		$row->[2] = $row->[7] if $row->[1] =~ /char/i;
+		#$row->[2] = $row->[7] if $row->[1] =~ /char/i;
 		$row->[10] = $pos;
 		push(@{$data{"$row->[8]"}{"$row->[0]"}}, @$row);
 
@@ -328,7 +328,7 @@ sub _get_indexes
 		#Packed : Indicates how the key is packed. NULL if it is not.
 		#Null : Contains YES if the column may contain NULL values and '' if not.
 		#Index_type : The index method used (BTREE, FULLTEXT, HASH, RTREE).
-		#Comment : Information about the index not described in its own column, such as disabled if the index is disabled. 
+		#Comment : Information about the index not described in its own column, such as disabled if the index is disabled.
 			my $idxname = $row->[2];
 			$row->[1] = 'UNIQUE' if (!$row->[1]);
 			$unique{$row->[0]}{$idxname} = $row->[1];
@@ -393,7 +393,7 @@ sub _count_indexes
 		#Packed : Indicates how the key is packed. NULL if it is not.
 		#Null : Contains YES if the column may contain NULL values and '' if not.
 		#Index_type : The index method used (BTREE, FULLTEXT, HASH, RTREE).
-		#Comment : Information about the index not described in its own column, such as disabled if the index is disabled. 
+		#Comment : Information about the index not described in its own column, such as disabled if the index is disabled.
 			push(@{$data{$row->[0]}{$row->[2]}}, $row->[4]);
 
 		}
@@ -496,7 +496,7 @@ sub _get_triggers
 {
 	my($self) = @_;
 
-	# Retrieve all indexes 
+	# Retrieve all indexes
 	# TRIGGER_CATALOG            | varchar(512)  | NO   |     |         |       |
 	# TRIGGER_SCHEMA             | varchar(64)   | NO   |     |         |       |
 	# TRIGGER_NAME               | varchar(64)   | NO   |     |         |       |
@@ -589,7 +589,7 @@ sub _unique_key
 		#Packed : Indicates how the key is packed. NULL if it is not.
 		#Null : Contains YES if the column may contain NULL values and '' if not.
 		#Index_type : The index method used (BTREE, FULLTEXT, HASH, RTREE).
-		#Comment : Information about the index not described in its own column, such as disabled if the index is disabled. 
+		#Comment : Information about the index not described in its own column, such as disabled if the index is disabled.
 
 			my $idxname = $row->[0] . '_idx' . $i;
 			if ($row->[2] ne 'PRIMARY') {
@@ -616,7 +616,7 @@ sub _get_functions
 {
 	my $self = shift;
 
-	# Retrieve all functions 
+	# Retrieve all functions
 	# SPECIFIC_NAME            | varchar(64)   | NO   |     |                     |       |
 	# ROUTINE_CATALOG          | varchar(512)  | NO   |     |                     |       |
 	# ROUTINE_SCHEMA           | varchar(64)   | NO   |     |                     |       |
@@ -787,7 +787,7 @@ sub _list_all_funtions
 {
 	my $self = shift;
 
-	# Retrieve all functions 
+	# Retrieve all functions
 	# ROUTINE_SCHEMA           | varchar(64)   | NO   |     |                     |       |
 	# ROUTINE_NAME             | varchar(64)   | NO   |     |                     |       |
 	# ROUTINE_TYPE             | varchar(9)    | NO   |     |                     |       |
@@ -818,7 +818,7 @@ sub _sql_type
         my ($self, $type, $len, $precision, $scale) = @_;
 
 	my $data_type = '';
-	
+
 	# Simplify timestamp type
 	$type =~ s/TIMESTAMP\(\d+\)/TIMESTAMP/i;
 	$type =~ s/TIME\(\d+\)/TIME/i;
@@ -1567,4 +1567,3 @@ sub _list_triggers
 }
 
 1;
-

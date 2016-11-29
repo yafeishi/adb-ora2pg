@@ -5235,7 +5235,7 @@ BEGIN
 										}
 									} else {
 										if (!$fct) {
-											push(@su)bcondition, "NEW.$self->{subpartitions}{$table}{$p}{$subpart}[$i]->{column} < " . Ora2Pg::PLSQL::plsql_to_plpgsql($self, $self->{subpartitions}{$table}{$p}{$subpart}[$i]->{value}));
+											push(@subcondition, "NEW.$self->{subpartitions}{$table}{$p}{$subpart}[$i]->{column} < " . Ora2Pg::PLSQL::plsql_to_plpgsql($self, $self->{subpartitions}{$table}{$p}{$subpart}[$i]->{value}));
 										} else {
 											push(@subcondition, "$fct(NEW.$colname) < " . Ora2Pg::PLSQL::plsql_to_plpgsql($self, $self->{subpartitions}{$table}{$p}{$subpart}[$i]->{value}));
 										}
