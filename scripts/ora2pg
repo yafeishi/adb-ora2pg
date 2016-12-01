@@ -31,7 +31,7 @@ use POSIX qw(locale_h sys_wait_h _exit);
 setlocale(LC_NUMERIC, '');
 setlocale(LC_ALL,     'C');
 
-my $VERSION = '17.5';
+my $VERSION = '17.6b';
 
 $| = 1;
 
@@ -345,6 +345,7 @@ Usage: ora2pg [-dhpqv --estimate_cost --dump_as_html] [--option value]
     -p | --plsql      : Enable PLSQL to PLPSQL code conversion.
     -P | --parallel num: Number of parallel tables to extract at the same time.
     -q | --quiet      : disable progress bar.
+		-r | --distribute_by_mode mode: table distribute by replication or ROUNDROBIN
     -s | --source DSN : Allow to set the Oracle DBI datasource.
     -t | --type export: Used to set the export type. It will override the one
 			given in the configuration file (TYPE).
