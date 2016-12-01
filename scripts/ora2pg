@@ -12,15 +12,15 @@
 #        it under the terms of the GNU General Public License as published by
 #        the Free Software Foundation, either version 3 of the License, or
 #        any later version.
-# 
+#
 #        This program is distributed in the hope that it will be useful,
 #        but WITHOUT ANY WARRANTY; without even the implied warranty of
 #        MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 #        GNU General Public License for more details.
-# 
+#
 #        You should have received a copy of the GNU General Public License
 #        along with this program. If not, see < http://www.gnu.org/licenses/ >.
-# 
+#
 #------------------------------------------------------------------------------
 use strict qw/vars/;
 
@@ -78,6 +78,10 @@ my $PG_USER = '';
 my $PG_PWD = '';
 my $COUNT_ROWS = 0;
 
+# add by jiangmj3 for distribute by mode ADB
+my $DISTRIBUTE_BY_MODE = '';
+# end by jiangmj3
+
 my @SCHEMA_ARRAY  = qw( TABLE PACKAGE VIEW GRANT SEQUENCE TRIGGER FUNCTION PROCEDURE TABLESPACE PARTITION TYPE MVIEW DBLINK SYNONYM DIRECTORY );
 my @EXTERNAL_ARRAY  = qw( KETTLE FDW );
 my @REPORT_ARRAY  = qw( SHOW_VERSION SHOW_REPORT SHOW_SCHEMA SHOW_TABLE SHOW_COLUMN SHOW_ENCODING  );
@@ -109,6 +113,7 @@ GetOptions (
 	'p|plsql!' => \$PLSQL,
 	'P|parallel=i' =>\$PARALLEL_TABLES,
 	'q|quiet!' => \$QUIET,
+	'r|distribute_by_mode=s' =>\$DISTRIBUTE_BY_MODE,
         't|type=s' => \$EXPORT_TYPE,
         'T|temp_dir=s' => \$TMP_DIR,
 	'v|version!' => \$SHOW_VER,
@@ -188,6 +193,19 @@ if ($FILE_CONF && ! -e $FILE_CONF) {
 
 push(@CAPABILITIES, @SCHEMA_ARRAY, @REPORT_ARRAY, @DATA_ARRAY, @EXTERNAL_ARRAY, @TEST_ARRAY);
 
+# add by jiangmj3
+# Validate export type
+$DISTRIBUTE_BY_MODE = uc($DISTRIBUTE_BY_MODE);
+if( $DISTRIBUTE_BY_MODE ne '')
+{
+        if (($DISTRIBUTE_BY_MODE ne 'REPLICATION') && ($DISTRIBUTE_BY_MODE ne 'ROUNDROBIN'))
+        {
+                print "FATAL: Unknow distribute type: $DISTRIBUTE_BY_MODE. Type supported: REPLICATION|ROUNDROBIN\n";
+                &usage();
+        }
+}
+# end by jiangmj3
+
 # Validate export type
 $EXPORT_TYPE = uc($EXPORT_TYPE);
 $EXPORT_TYPE =~ s/DATA/COPY/;
@@ -236,6 +254,7 @@ $AUDIT_USER =~ s/[;\s]+/,/g;
 my $schema = new Ora2Pg (
 	config => $FILE_CONF || $CONFIG_FILE,
 	type   => $EXPORT_TYPE,
+	distribute_by_mode => $DISTRIBUTE_BY_MODE,
 	debug  => $DEBUG,
 	logfile=> $LOGFILE,
 	output => $OUTFILE,
@@ -280,7 +299,7 @@ if ( ($EXPORT_TYPE !~ /^SHOW_/i) && !$INPUT_FILE ) {
 	$schema->export_schema();
 }
 
-# Check if error occurs during data export 
+# Check if error occurs during data export
 unless(opendir(DIR, "$TMP_DIR")) {
 	print "FATAL: can't opendir $TMP_DIR: $!\n";
 	exit 1;
@@ -437,7 +456,7 @@ sub create_project
 		my @cf = <IN>;
 		close(IN);
 		# Create a generic configuration file only if it has the .dist extension
-		# otherwise use the configuration given at command line (-c option) 
+		# otherwise use the configuration given at command line (-c option)
 		if ($conf_file =~ /\.dist/) {
 			&make_config_generic(\@cf);
 		}
@@ -650,10 +669,10 @@ confirm () {
 	    # call with a prompt string or use a default
 	    read -r -p "${msg} [y/N/q] " response
 	    case $response in
-		[yY][eE][sS]|[yY]) 
+		[yY][eE][sS]|[yY])
 		    true
 		    ;;
-		[qQ][uU][iI][tT]|[qQ]) 
+		[qQ][uU][iI][tT]|[qQ])
 		    exit
 		    ;;
 		*)
@@ -723,7 +742,7 @@ import_constraints () {
 }
 
 # Command line options
-while getopts "b:d:e:h:j:l:n:o:p:P:t:U:aDfiIsyx?"  opt; do
+while getopts "b:d:e:h:j:l:n:o:p:P:t:r:U:aDfiIsyx?"  opt; do
     case "$opt" in
 	a) DATA_ONLY=1;;
 	b) SQL_POST_SCRIPT=$OPTARG;;
@@ -742,6 +761,7 @@ while getopts "b:d:e:h:j:l:n:o:p:P:t:U:aDfiIsyx?"  opt; do
         P) PARALLEL_TABLES=" -P $OPTARG";;
         s) SCHEMA_ONLY=1;;
         t) EXPORT_TYPE=$OPTARG;;
+		r) DISTRIBUTE_BY_MODE=$OPTARG;;
         U) DB_USER=" -U $OPTARG";;
 	x) IMPORT_INDEXES_AFTER=1;;
         y) AUTORUN=1;;
@@ -992,4 +1012,3 @@ if [ $SCHEMA_ONLY -eq 0 ]; then
 fi
 
 exit 0
-

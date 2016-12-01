@@ -890,9 +890,6 @@ sub _init
 	# Create tables with OIDs or not, default to not create OIDs
 	$self->{with_oid} ||= 0;
 
-	# Create tables with 'distribute by replication' or not, default to not . add by danghb
-	$self->{table_rep} ||= 0;
-
 	# Should we replace zero date with something else than NULL
 	$self->{replace_zero_date} ||= '';
 	if ($self->{replace_zero_date} && (uc($self->{replace_zero_date}) ne '-INFINITY') && ($self->{replace_zero_date} !~ /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/)) {
@@ -5079,8 +5076,10 @@ BEGIN
 			my $old_pos = '';
 			my $old_part = '';
 			my $owner = '';
-			# get index info,include pk index
+			# get index info,include pk index by danghb
 			my ($uniqueness, $indexes, $idx_type, $idx_tbsp) = $self->_get_indexes($table,$self->{schema},1);
+      # get table primary key by danghb
+			my $table_pk = $self->_get_primary_keys($table, $self->{tables}{$table}{unique_key});
 			foreach my $pos (sort {$a <=> $b} keys %{$self->{partitions}{$table}}) {
 				foreach my $part (sort {$self->{partitions}{$table}{$pos}{$a}->{'colpos'} <=> $self->{partitions}{$table}{$pos}{$b}->{'colpos'}} keys %{$self->{partitions}{$table}{$pos}}) {
 					if (!$self->{quiet} && !$self->{debug}) {
@@ -5120,8 +5119,14 @@ BEGIN
 						if ($colname =~ s/([^\(]+)\(([^\)]+)\)/$2/) {
 							$fct = $1;
 						}
+						# add by danghb for adb:add primary key to sub_table 2016-12-01
+						$sub_table_pkey_name = "$tb_name"."_pkey";
+						#$create_table{$table}{'index'} .="-- Create primary key on table $tb_name:\n";
+						#$create_table{$table}{'index'} .= "alter table $tb_name add constraint $sub_table_pkey_name $table_pk;\n";
+						# end danghb
 						my $cindx = $self->{partitions}{$table}{$pos}{$part}[$i]->{column} || '';
 						$cindx = Ora2Pg::PLSQL::plsql_to_plpgsql($self, $cindx);
+						$create_table{$table}{'index'} .= "-- Create index on table $tb_name:\n";
 						$create_table{$table}{'index'} .= "CREATE INDEX ${tb_name}_$colname ON $tb_name ($cindx);\n";
 						if ($self->{partitions_default}{$table} && ($create_table{$table}{'index'} !~ /ON $self->{partitions_default}{$table} /)) {
 							$cindx = $self->{partitions}{$table}{$pos}{$part}[$i]->{column} || '';
@@ -5131,14 +5136,15 @@ BEGIN
 						# add by danghb 2016-11-25
 						# create index on sub_table ,indexes are from parent_table
 						foreach my $idx (keys %{$indexes->{$table}}){
-							    my $idx_unique = $uniqueness->{$table}->{$idx};
+							  my $idx_unique = $uniqueness->{$table}->{$idx};
+								my $cols = join(",",@{$indexes->{$table}->{$idx}});
+								my $idx_tbs = $idx_tbsp->{$table}->{$idx};
 							    if ( $idx_unique eq 'NONUNIQUE') {
 							    	$idx_unique = '';
 							    }
-								my $cols = join(",",@{$indexes->{$table}->{$idx}});
-								my $idx_tbs = $idx_tbsp->{$table}->{$idx};
+								my $idxname = $tb_name."_".$idx;
 								my $idxsql = '';
-								$idxsql .= "CREATE $idx_unique INDEX $tb_name"."_$idx"." ON $tb_name ($cols);\n";
+								$idxsql .= "CREATE $idx_unique INDEX $idxname ON $tb_name ($cols);\n";
 								$create_table{$table}{'index'} .= $idxsql;
 
 						}
@@ -5162,6 +5168,11 @@ BEGIN
 					$check_cond = Ora2Pg::PLSQL::plsql_to_plpgsql($self, $check_cond);
 					$create_table{$table}{table} .= $check_cond;
 					$create_table{$table}{table} .= "\n) ) INHERITS ($table);\n";
+					# Change distribute by mode for ADB by jiangmj3 2016-11-24
+					if( ($self->{distribute_by_mode} eq 'REPLICATION') || ($self->{distribute_by_mode} eq 'ROUNDROBIN') ){
+						$create_table{$table}{table} .= "ALTER TABLE $tb_name DISTRIBUTE BY $self->{distribute_by_mode};\n";
+					}
+					# end by jiangmj3
 					$owner = $self->{force_owner} if ($self->{force_owner} ne "1");
 					if ($owner) {
 						if (!$self->{preserve_case}) {
@@ -5208,20 +5219,26 @@ BEGIN
 									}
 									$cindx = join(',', @ind_col);
 									$cindx = Ora2Pg::PLSQL::plsql_to_plpgsql($self, $cindx);
+									# add by danghb for adb:add primary key to sub_table 2016-12-01
+									$sub_table_pkey_name = "${tb_name}_$sub_tb_name"."_pkey";
+									#$create_table{$table}{'index'} .="-- Create primary key on table ${tb_name}_$sub_tb_name:\n";
+									#$create_table{$table}{'index'} .= "alter table ${tb_name}_$sub_tb_name add constraint $sub_table_pkey_name $table_pk;\n";
+									# end danghb
+									$create_table{$table}{'index'} .= "-- Create index on table ${tb_name}_$sub_tb_name:\n";
 									$create_table{$table}{'index'} .= "CREATE INDEX ${tb_name}_${sub_tb_name}_$colname ON ${tb_name}_$sub_tb_name ($cindx);\n";
                         # add by danghb 2016-11-25
 						            # create index on sub_table ,indexes are from parent_table
 						            foreach my $idx (keys %{$indexes->{$table}}){
-							  			  my $idx_unique = $uniqueness->{$table}->{$idx};
-							  			  if ( $idx_unique eq 'NONUNIQUE') {
-							    			$idx_unique = '';
-							   			  }
-										      my $cols = join(",",@{$indexes->{$table}->{$idx}});
-								          my $idx_tbs = $idx_tbsp->{$table}->{$idx};
+													my $idx_unique = $uniqueness->{$table}->{$idx};
+													my $cols = join(",",@{$indexes->{$table}->{$idx}});
+													my $idx_tbs = $idx_tbsp->{$table}->{$idx};
+												    if ( $idx_unique eq 'NONUNIQUE') {
+												    	$idx_unique = '';
+												    }
+													my $idxname = $sub_tb_name."_".$idx;
 								          my $idxsql = '';
-								          $idxsql .= "CREATE $idx_unique INDEX $sub_tb_name"."_$idx"." ON $sub_tb_name ($cols);\n";
+								          $idxsql .= "CREATE $idx_unique INDEX $idxname ON $sub_tb_name ($cols);\n";
 								          $create_table{$table}{'index'} .= $idxsql;
-
 						            }
 						           # end danghb
 									if ($self->{subpartitions_default}{$table} && ($create_table{$table}{'index'} !~ /ON $self->{subpartitions_default}{$table} /)) {
@@ -5245,6 +5262,11 @@ BEGIN
 								$sub_check_cond = Ora2Pg::PLSQL::plsql_to_plpgsql($self, $sub_check_cond);
 								$create_table{$table}{table} .= "$check_cond AND $sub_check_cond";
 								$create_table{$table}{table} .= "\n) ) INHERITS ($table);\n";
+								# Change distribute by mode for ADB by jiangmj3 2016-11-24
+								if( ($self->{distribute_by_mode} eq 'REPLICATION') || ($self->{distribute_by_mode} eq 'ROUNDROBIN') ){
+									$create_table{$table}{table} .= "ALTER TABLE ${tb_name}_$sub_tb_name DISTRIBUTE BY $self->{distribute_by_mode};\n";
+								}
+								# end by jiangmj3
 								$owner = $self->{force_owner} if ($self->{force_owner} ne "1");
 								if ($owner) {
 									if (!$self->{preserve_case}) {
@@ -5634,12 +5656,10 @@ CREATE TRIGGER ${table}_trigger_insert
 			if ( ($self->{type} ne 'FDW') && (!$self->{external_to_fdw} || (!grep(/^$table$/i, keys %{$self->{external_table}}) && !$self->{tables}{$table}{table_info}{connection})) ) {
 				my $withoid = '';
 				$withoid = 'WITH (OIDS)' if ($self->{with_oid});
-				# add by danghb.for table_rep
-				$table_rep = 'DISTRIBUTE BY replication' if ($self->{table_rep});
 				if ($self->{use_tablespace} && $self->{tables}{$table}{table_info}{tablespace} && !grep(/^$self->{tables}{$table}{table_info}{tablespace}$/i, @{$self->{default_tablespaces}})) {
-					$sql_output .= ") $withoid TABLESPACE $self->{tables}{$table}{table_info}{tablespace} $table_rep;\n";
+					$sql_output .= ") $withoid TABLESPACE $self->{tables}{$table}{table_info}{tablespace} ;\n";
 				} else {
-					$sql_output .= ") $withoid $table_rep;\n";
+					$sql_output .= ") $withoid ;\n";
 				}
 			} elsif ( grep(/^$table$/i, keys %{$self->{external_table}}) ) {
 				$sql_output .= ") SERVER \L$self->{external_table}{$table}{directory}\E OPTIONS(filename '$self->{external_table}{$table}{directory_path}$self->{external_table}{$table}{location}', format 'csv', delimiter '$self->{external_table}{$table}{delimiter}');\n";
