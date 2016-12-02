@@ -5080,6 +5080,7 @@ BEGIN
 			my ($uniqueness, $indexes, $idx_type, $idx_tbsp) = $self->_get_indexes($table,$self->{schema},1);
       # get table primary key by danghb
 			my $table_pk = $self->_get_primary_keys($table, $self->{tables}{$table}{unique_key});
+			#print "$table primary key is $table_pk\n";
 			foreach my $pos (sort {$a <=> $b} keys %{$self->{partitions}{$table}}) {
 				foreach my $part (sort {$self->{partitions}{$table}{$pos}{$a}->{'colpos'} <=> $self->{partitions}{$table}{$pos}{$b}->{'colpos'}} keys %{$self->{partitions}{$table}{$pos}}) {
 					if (!$self->{quiet} && !$self->{debug}) {
@@ -5119,36 +5120,21 @@ BEGIN
 						if ($colname =~ s/([^\(]+)\(([^\)]+)\)/$2/) {
 							$fct = $1;
 						}
-						# add by danghb for adb:add primary key to sub_table 2016-12-01
-						$sub_table_pkey_name = "$tb_name"."_pkey";
-						#$create_table{$table}{'index'} .="-- Create primary key on table $tb_name:\n";
-						#$create_table{$table}{'index'} .= "alter table $tb_name add constraint $sub_table_pkey_name $table_pk;\n";
-						# end danghb
 						my $cindx = $self->{partitions}{$table}{$pos}{$part}[$i]->{column} || '';
 						$cindx = Ora2Pg::PLSQL::plsql_to_plpgsql($self, $cindx);
-						$create_table{$table}{'index'} .= "-- Create index on table $tb_name:\n";
+   					$create_table{$table}{'index'} .= "-- Create index on table $tb_name:\n";
 						$create_table{$table}{'index'} .= "CREATE INDEX ${tb_name}_$colname ON $tb_name ($cindx);\n";
+
 						if ($self->{partitions_default}{$table} && ($create_table{$table}{'index'} !~ /ON $self->{partitions_default}{$table} /)) {
 							$cindx = $self->{partitions}{$table}{$pos}{$part}[$i]->{column} || '';
 							$cindx = Ora2Pg::PLSQL::plsql_to_plpgsql($self, $cindx);
-							$create_table{$table}{'index'} .= "CREATE INDEX $self->{partitions_default}{$table}_$colname ON $self->{partitions_default}{$table} ($cindx);\n";
+							# fix bug:when prefix_partition is 1,default table name should concat with $tablename by danghb
+							my $deftb = '';
+							$deftb = "${table}_" if ($self->{prefix_partition});
+							$deftb = "$deftb"."$self->{partitions_default}{$table}";
+							$create_table{$table}{'index'} .= "CREATE INDEX $deftb"."_"."$colname ON $deftb ($cindx);\n";
 						}
-						# add by danghb 2016-11-25
-						# create index on sub_table ,indexes are from parent_table
-						foreach my $idx (keys %{$indexes->{$table}}){
-							  my $idx_unique = $uniqueness->{$table}->{$idx};
-								my $cols = join(",",@{$indexes->{$table}->{$idx}});
-								my $idx_tbs = $idx_tbsp->{$table}->{$idx};
-							    if ( $idx_unique eq 'NONUNIQUE') {
-							    	$idx_unique = '';
-							    }
-								my $idxname = $tb_name."_".$idx;
-								my $idxsql = '';
-								$idxsql .= "CREATE $idx_unique INDEX $idxname ON $tb_name ($cols);\n";
-								$create_table{$table}{'index'} .= $idxsql;
 
-						}
-						# end danghb
 						push(@ind_col, $self->{partitions}{$table}{$pos}{$part}[$i]->{column}) if (!grep(/^$self->{partitions}{$table}{$pos}{$part}[$i]->{column}$/, @ind_col));
 						if ($self->{partitions}{$table}{$pos}{$part}[$i]->{type} eq 'LIST') {
 							if (!$fct) {
@@ -5219,30 +5205,23 @@ BEGIN
 									}
 									$cindx = join(',', @ind_col);
 									$cindx = Ora2Pg::PLSQL::plsql_to_plpgsql($self, $cindx);
+									my $sub_part_tbname = ${tb_name}."_".$sub_tb_name;
 									# add by danghb for adb:add primary key to sub_table 2016-12-01
-									$sub_table_pkey_name = "${tb_name}_$sub_tb_name"."_pkey";
-									#$create_table{$table}{'index'} .="-- Create primary key on table ${tb_name}_$sub_tb_name:\n";
-									#$create_table{$table}{'index'} .= "alter table ${tb_name}_$sub_tb_name add constraint $sub_table_pkey_name $table_pk;\n";
+									$sub_table_pkey_name = "$sub_part_tbname"."_pkey";
+									#$create_table{$table}{'index'} .="-- Create primary key on table $sub_part_tbname:\n";
+									#$create_table{$table}{'index'} .= "alter table $sub_part_tbname add constraint $sub_table_pkey_name $table_pk;\n";
 									# end danghb
-									$create_table{$table}{'index'} .= "-- Create index on table ${tb_name}_$sub_tb_name:\n";
-									$create_table{$table}{'index'} .= "CREATE INDEX ${tb_name}_${sub_tb_name}_$colname ON ${tb_name}_$sub_tb_name ($cindx);\n";
-                        # add by danghb 2016-11-25
-						            # create index on sub_table ,indexes are from parent_table
-						            foreach my $idx (keys %{$indexes->{$table}}){
-													my $idx_unique = $uniqueness->{$table}->{$idx};
-													my $cols = join(",",@{$indexes->{$table}->{$idx}});
-													my $idx_tbs = $idx_tbsp->{$table}->{$idx};
-												    if ( $idx_unique eq 'NONUNIQUE') {
-												    	$idx_unique = '';
-												    }
-													my $idxname = $sub_tb_name."_".$idx;
-								          my $idxsql = '';
-								          $idxsql .= "CREATE $idx_unique INDEX $idxname ON $sub_tb_name ($cols);\n";
-								          $create_table{$table}{'index'} .= $idxsql;
-						            }
-						           # end danghb
+									my $idxsql = $self->_create_indexes_on_sub_table($table,$sub_part_tbname);
+				          $create_table{$table}{'index'} .= $idxsql;
+
 									if ($self->{subpartitions_default}{$table} && ($create_table{$table}{'index'} !~ /ON $self->{subpartitions_default}{$table} /)) {
-										$create_table{$table}{'index'} .= "CREATE INDEX ${tb_name}_$self->{subpartitions_default}{$table}_$colname ON ${tb_name}_$self->{subpartitions_default}{$table} ($cindx);\n";
+										#$create_table{$table}{'index'} .= "CREATE INDEX ${tb_name}_$self->{subpartitions_default}{$table}_$colname ON ${tb_name}_$self->{subpartitions_default}{$table} ($cindx);\n";
+										# fix bug:when prefix_partition is 1,default table name should concat with $tablename by danghb
+										my $deftb = '';
+										$deftb = "${table}_" if ($self->{prefix_partition});
+										$deftb = "$deftb"."$self->{subpartitions_default}{$table}";
+										$create_table{$table}{'index'} .= "CREATE INDEX $deftb"."_"."$colname ON $deftb ($cindx);\n";
+
 									}
 									if ($self->{subpartitions}{$table}{$p}{$subpart}[$i]->{type} eq 'LIST') {
 										if (!$fct) {
@@ -5293,14 +5272,35 @@ BEGIN
 					$cond = 'ELSIF';
 					$old_part = $part;
 					$i++;
+					# add by danghb for adb:add primary key to sub_table 2016-12-01
+					my $sub_table_pkey_name = "$tb_name"."_pkey";
+					#$create_table{$table}{'index'} .="-- Create primary key on table $tb_name:\n";
+					#$create_table{$table}{'index'} .= "alter table $tb_name add constraint $sub_table_pkey_name $table_pk;\n";
+
+					# create index on sub_table ,indexes are from parent_table
+          my $idxsql = $self->_create_indexes_on_sub_table($table,$tb_name);
+          $create_table{$table}{'index'} .= $idxsql;
+          # end danghb
 				}
 				$old_pos = $pos;
 			}
+
 			if ($self->{partitions_default}{$table}) {
 				my $deftb = '';
 				$deftb = "${table}_" if ($self->{prefix_partition});
+				$deftb = "$deftb"."$self->{partitions_default}{$table}";
+				# create index on default table by danghb
+				$create_table{$table}{'index'} .= "\n-- Create index on default table:\n";
+				my $idxsql = $self->_create_indexes_on_sub_table($table,$deftb);
+				$create_table{$table}{'index'} .= $idxsql;
+        # end danghb
+				$create_table{$table}{table} .= "\n-- Create default table, where datas are inserted if no condition match\n";
+				$create_table{$table}{table} .= "CREATE TABLE $deftb () INHERITS ($table);\n";
+				if( ($self->{distribute_by_mode} eq 'REPLICATION') || ($self->{distribute_by_mode} eq 'ROUNDROBIN') ){
+					$create_table{$table}{table} .= "ALTER TABLE $deftb  DISTRIBUTE BY $self->{distribute_by_mode};\n";
+				}
 				$function .= $funct_cond . qq{	ELSE
-                INSERT INTO $deftb$self->{partitions_default}{$table} VALUES (NEW.*);
+                INSERT INTO $deftb VALUES (NEW.*);
 };
 			} else {
 				$function .= $funct_cond . qq{	ELSE
@@ -5317,14 +5317,12 @@ END;
 LANGUAGE plpgsql;
 };
 
+
 			$sql_output .= qq{
 $create_table{$table}{table}
 };
-			$sql_output .= qq{
--- Create default table, where datas are inserted if no condition match
-CREATE TABLE $self->{partitions_default}{$table} () INHERITS ($table);
-} if ($self->{partitions_default}{$table});
-			$sql_output .= qq{
+
+$sql_output .= qq{
 -- Create indexes on each partition table
 $create_table{$table}{'index'}
 
@@ -6638,6 +6636,32 @@ sub _create_foreign_keys
 	}
 
 	return wantarray ? @out : join("\n", @out);
+}
+
+=head2 _create_indexes_on_sub_table
+
+This function return SQL code to create parent index on sub_table
+
+=cut
+
+sub _create_indexes_on_sub_table
+{
+    my ($self,$table,$sub_table) = @_;
+
+    my ($uniqueness, $indexes, $idx_type, $idx_tbsp) = $self->_get_indexes($table,$self->{schema},1);
+    my $index_sql = "";
+    foreach my $idx (sort keys %{$indexes->{$table}}){
+        my $idx_unique = $uniqueness->{$table}->{$idx};
+        my $cols = join(",",@{$indexes->{$table}->{$idx}});
+        my $idx_tbs = $idx_tbsp->{$table}->{$idx};
+          if ( $idx_unique eq 'NONUNIQUE') {
+            $idx_unique = '';
+          }
+        my $idxname = $sub_table."_".$idx;
+				#$index_sql .= "-- Create index on table $sub_table:\n";
+        $index_sql .= "CREATE $idx_unique INDEX $idxname ON $sub_table ($cols);\n";
+    }
+    return $index_sql;
 }
 
 =head2 _drop_foreign_keys
