@@ -5125,14 +5125,17 @@ BEGIN
    					$create_table{$table}{'index'} .= "-- Create index on table $tb_name:\n";
 						$create_table{$table}{'index'} .= "CREATE INDEX ${tb_name}_$colname ON $tb_name ($cindx);\n";
 
-						if ($self->{partitions_default}{$table} && ($create_table{$table}{'index'} !~ /ON $self->{partitions_default}{$table} /)) {
+						#if ($self->{partitions_default}{$table} && ($create_table{$table}{'index'} !~ /ON $self->{partitions_default}{$table} /)) {
+						if ($self->{partitions_default}{$table}) {
 							$cindx = $self->{partitions}{$table}{$pos}{$part}[$i]->{column} || '';
 							$cindx = Ora2Pg::PLSQL::plsql_to_plpgsql($self, $cindx);
 							# fix bug:when prefix_partition is 1,default table name should concat with $tablename by danghb
 							my $deftb = '';
 							$deftb = "${table}_" if ($self->{prefix_partition});
 							$deftb = "$deftb"."$self->{partitions_default}{$table}";
-							$create_table{$table}{'index'} .= "CREATE INDEX $deftb"."_"."$colname ON $deftb ($cindx);\n";
+							if ($create_table{$table}{'index'} !~ /ON $deftb /) {
+								$create_table{$table}{'index'} .= "CREATE INDEX $deftb"."_"."$colname ON $deftb ($cindx);\n";
+							}
 						}
 
 						push(@ind_col, $self->{partitions}{$table}{$pos}{$part}[$i]->{column}) if (!grep(/^$self->{partitions}{$table}{$pos}{$part}[$i]->{column}$/, @ind_col));
@@ -5214,14 +5217,15 @@ BEGIN
 									my $idxsql = $self->_create_indexes_on_sub_table($table,$sub_part_tbname);
 				          $create_table{$table}{'index'} .= $idxsql;
 
-									if ($self->{subpartitions_default}{$table} && ($create_table{$table}{'index'} !~ /ON $self->{subpartitions_default}{$table} /)) {
+									if ($self->{subpartitions_default}{$table} ) {
 										#$create_table{$table}{'index'} .= "CREATE INDEX ${tb_name}_$self->{subpartitions_default}{$table}_$colname ON ${tb_name}_$self->{subpartitions_default}{$table} ($cindx);\n";
 										# fix bug:when prefix_partition is 1,default table name should concat with $tablename by danghb
 										my $deftb = '';
 										$deftb = "${table}_" if ($self->{prefix_partition});
 										$deftb = "$deftb"."$self->{subpartitions_default}{$table}";
-										$create_table{$table}{'index'} .= "CREATE INDEX $deftb"."_"."$colname ON $deftb ($cindx);\n";
-
+										if ($create_table{$table}{'index'} !~ /ON $deftb /) {
+											$create_table{$table}{'index'} .= "CREATE INDEX $deftb"."_"."$colname ON $deftb ($cindx);\n";
+										}
 									}
 									if ($self->{subpartitions}{$table}{$p}{$subpart}[$i]->{type} eq 'LIST') {
 										if (!$fct) {
