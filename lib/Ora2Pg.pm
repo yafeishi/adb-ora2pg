@@ -320,6 +320,11 @@ our @GRANTS = (
 	'EXECUTE'
 );
 
+#add by jiangmj3
+my $first_column_name = undef;
+my $is_first = 0;
+#add end
+
 $SIG{'CHLD'} = 'DEFAULT';
 
 ####
@@ -3304,7 +3309,7 @@ LANGUAGE plpgsql ;
 					}
 					$sql_output .= ";\n";
 					# Set the index definition
-                                        my ($idx, $fts_idx) = $self->_create_indexes($view, 0, %{$self->{materialized_views}{$view}{indexes}});
+					my ($idx, $fts_idx) = $self->_create_indexes($view, 0, %{$self->{materialized_views}{$view}{indexes}});
 					$sql_output .= "$idx$fts_idx\n\n";
 				}
 			}
@@ -3636,8 +3641,8 @@ LANGUAGE plpgsql ;
 		my $dirprefix = '';
 		$dirprefix = "$self->{output_dir}/" if ($self->{output_dir});
 		my $nothing = 0;
-                my $i = 1;
-                my $num_total_trigger = $#{$self->{triggers}} + 1;
+		my $i = 1;
+		my $num_total_trigger = $#{$self->{triggers}} + 1;
 		foreach my $trig (sort {$a->[0] cmp $b->[0]} @{$self->{triggers}}) {
 
 			if (!$self->{quiet} && !$self->{debug}) {
@@ -5078,7 +5083,7 @@ BEGIN
 			my $owner = '';
 			# get index info,include pk index by danghb
 			my ($uniqueness, $indexes, $idx_type, $idx_tbsp) = $self->_get_indexes($table,$self->{schema},1);
-      # get table primary key by danghb
+      		# get table primary key by danghb
 			my $table_pk = $self->_get_primary_keys($table, $self->{tables}{$table}{unique_key});
 			#print "$table primary key is $table_pk\n";
 			foreach my $pos (sort {$a <=> $b} keys %{$self->{partitions}{$table}}) {
@@ -5122,7 +5127,7 @@ BEGIN
 						}
 						my $cindx = $self->{partitions}{$table}{$pos}{$part}[$i]->{column} || '';
 						$cindx = Ora2Pg::PLSQL::plsql_to_plpgsql($self, $cindx);
-   					$create_table{$table}{'index'} .= "-- Create index on table $tb_name:\n";
+   						$create_table{$table}{'index'} .= "-- Create index on table $tb_name:\n";
 						$create_table{$table}{'index'} .= "CREATE INDEX ${tb_name}_$colname ON $tb_name ($cindx);\n";
 
 						#if ($self->{partitions_default}{$table} && ($create_table{$table}{'index'} !~ /ON $self->{partitions_default}{$table} /)) {
@@ -5215,7 +5220,7 @@ BEGIN
 									#$create_table{$table}{'index'} .= "alter table $sub_part_tbname add constraint $sub_table_pkey_name $table_pk;\n";
 									# end danghb
 									my $idxsql = $self->_create_indexes_on_sub_table($table,$sub_part_tbname);
-				          $create_table{$table}{'index'} .= $idxsql;
+				          			$create_table{$table}{'index'} .= $idxsql;
 
 									if ($self->{subpartitions_default}{$table} ) {
 										#$create_table{$table}{'index'} .= "CREATE INDEX ${tb_name}_$self->{subpartitions_default}{$table}_$colname ON ${tb_name}_$self->{subpartitions_default}{$table} ($cindx);\n";
@@ -5297,7 +5302,7 @@ BEGIN
 				$create_table{$table}{'index'} .= "\n-- Create index on default table:\n";
 				my $idxsql = $self->_create_indexes_on_sub_table($table,$deftb);
 				$create_table{$table}{'index'} .= $idxsql;
-        # end danghb
+        		# end danghb
 				$create_table{$table}{table} .= "\n-- Create default table, where datas are inserted if no condition match\n";
 				$create_table{$table}{table} .= "CREATE TABLE $deftb () INHERITS ($table);\n";
 				if( ($self->{distribute_by_mode} eq 'REPLICATION') || ($self->{distribute_by_mode} eq 'ROUNDROBIN') ){
@@ -5472,6 +5477,7 @@ CREATE TRIGGER ${table}_trigger_insert
 	foreach my $table (sort { $self->{tables}{$a}{internal_id} <=> $self->{tables}{$b}{internal_id} } keys %{$self->{tables}}) {
 
 		$self->logit("Dumping table $table...\n", 1);
+		$is_first = 0;
 
 		if (!$self->{quiet} && !$self->{debug}) {
 			print STDERR $self->progress_bar($ib, $num_total_table, 25, '=', 'tables', "exporting $table" ), "\r";
@@ -5615,6 +5621,13 @@ CREATE TRIGGER ${table}_trigger_insert
 				} else {
 					$sql_output .= "\t\"$fname\" $type";
 				}
+				
+				if( $is_first == 0)
+				{
+					$is_first = 1;
+					$first_column_name = $fname;
+				}
+				
 				if ($foreign && $self->is_primary_key_column($table, $f->[0])) {
 					 $sql_output .= " OPTIONS (key 'true')";
 				}
@@ -5748,7 +5761,14 @@ CREATE TRIGGER ${table}_trigger_insert
 			}
 
 			# Set the indexes definition
-			my ($idx, $fts_idx) = $self->_create_indexes($table, 0, %{$self->{tables}{$table}{indexes}});
+			#add by jiangmj3 for create uniqure index 2017-01-16 "ERROR:  Cannot create index whose evaluation cannot be enforced to remote nodes"
+			$self->logit("Dumping index for table $table...\n", 1);
+			my $primary_keys .= $self->_get_primary_columms($table, $self->{tables}{$table}{unique_key});
+			$self->logit("Get primary keys ($primary_keys) and first column name($first_column_name) for table $table...\n", 1);
+			my $unique_index_for_adb = '';
+			$primary_keys?($unique_index_for_adb .= $primary_keys):($unique_index_for_adb .= $first_column_name); 
+			my ($idx, $fts_idx) = $self->_create_indexes($table, 0,  $unique_index_for_adb, %{$self->{tables}{$table}{indexes}});
+			#add end
 			$indices .= "$idx\n" if ($idx);
 			$fts_indices .= "$fts_idx\n" if ($fts_idx);
 			if (!$self->{file_per_index}) {
@@ -5990,8 +6010,7 @@ and triggers to create for FTS indexes.
 =cut
 sub _create_indexes
 {
-	my ($self, $table, $indexonly, %indexes) = @_;
-
+	my ($self, $table, $indexonly, $unique_index_for_adb, %indexes) = @_;
 	my $tbsaved = $table;
 
 	# The %indexes hash can be passed from table or materialized views definition
@@ -6212,6 +6231,20 @@ CREATE TRIGGER $trig_name BEFORE INSERT OR UPDATE
 				$str .= "-- Was declared as DOMAIN index, please check for FTS adaptation if require\n";
 				$str .= "-- CREATE$unique INDEX$concurrently \L$idxname$self->{indexes_suffix}\E ON $table ($columns)";
 			} else {
+				# add by jiangmj3
+				my @arr_unique_index = split(/\s*,\s*/, $unique_index_for_adb);
+				my @arr_columns = split(/\s*,\s*/, $columns);
+				my @array3 = (@arr_columns, @arr_unique_index);
+				my @array3_new =();
+				foreach my $item ( @array3 )
+				{
+					if ( ! grep( /$item/, @array3_new ) )
+					{
+						push( @array3_new, $item );
+					}
+				}
+				$columns = join(',',@array3_new);
+				# add end 
 				$str .= "CREATE$unique INDEX$concurrently \L$idxname$self->{indexes_suffix}\E ON $table ($columns)";
 			}
 			if ($self->{use_tablespace} && $self->{$objtyp}{$tbsaved}{idx_tbsp}{$idx} && !grep(/^$self->{$objtyp}{$tbsaved}{idx_tbsp}{$idx}$/i, @{$self->{default_tablespaces}})) {
@@ -6422,6 +6455,53 @@ sub _get_primary_keys
 				}
 				$out .= ",\n";
 			}
+		}
+	}
+	$out =~ s/,$//s;
+
+	return $out;
+}
+
+=head2 _get_primary_columms
+
+This function return Columms to add primary keys of a create index definition
+
+=cut
+sub _get_primary_columms
+{
+	my ($self, $table, $unique_key) = @_;
+
+	my $out = '';
+
+	# Set the unique (and primary) key definition 
+	foreach my $consname (keys %$unique_key) {
+		next if ($self->{pkey_in_create} && ($unique_key->{$consname}{type} ne 'P'));
+		my $constype =   $unique_key->{$consname}{type};
+		my $constgen =   $unique_key->{$consname}{generated};
+		my $index_name = $unique_key->{$consname}{index_name};
+		my @conscols = @{$unique_key->{$consname}{columns}};
+		my %constypenames = ('U' => 'UNIQUE', 'P' => 'PRIMARY KEY');
+		my $constypename = $constypenames{$constype};
+		for (my $i = 0; $i <= $#conscols; $i++) {
+			# Change column names
+			if (exists $self->{replaced_cols}{"\L$table\E"}{"\L$conscols[$i]\E"} && $self->{replaced_cols}{"\L$table\E"}{"\L$conscols[$i]\E"}) {
+				$conscols[$i] = $self->{replaced_cols}{"\L$table\E"}{"\L$conscols[$i]\E"};
+			}
+		}
+		map { s/"//gs } @conscols;
+		if (!$self->{preserve_case}) {
+			map { $_ = $self->quote_reserved_words($_) } @conscols;
+		} else {
+			map { s/^/"/; s/$/"/; } @conscols;
+		}
+		my $columnlist = join(',', @conscols);
+		if (!$self->{preserve_case}) {
+			$columnlist = lc($columnlist);
+		}
+		if ($columnlist) 
+		{
+			$out .= "$columnlist";
+			$out .= ",";
 		}
 	}
 	$out =~ s/,$//s;
@@ -9390,7 +9470,15 @@ sub format_data_type
 		} elsif ($cond->{isbytea}) {
 			$col = $self->_escape_lob($col, $cond->{raw} ? 'RAW' : 'BLOB', $cond);
 		} elsif ($cond->{istext}) {
-			$cond->{clob} ? $col = $self->_escape_lob($col, 'CLOB', $cond) : $col = $self->escape_copy($col);
+			if($cond->{clob})
+			{
+				$col = $self->_escape_lob($col, 'CLOB', $cond);
+			}
+			else
+			{
+				$col = $self->escape_copy($col);
+			}
+			#$cond->{clob} ? $col = $self->_escape_lob($col, 'CLOB', $cond) : $col = $self->escape_copy($col);
 		} elsif ($cond->{isdate}) {
 			if ($col =~ /^0000-00-00/) {
 				$col = $self->{replace_zero_date} || '\N';
@@ -14626,6 +14714,17 @@ sub _escape_lob
 			$col = '\\\\x' . $col;
 		} elsif (($generic_type eq 'CLOB') || $cond->{istext}) {
 			$col = $self->escape_copy($col);
+		}
+		if( $col eq '' || $col eq '\\\\x' )
+		{
+			if (!$cond->{isnotnull} || ($self->{empty_lob_null} && ($cond->{clob} || $cond->{isbytea}))) 
+			{
+				$col = '\N';
+			} 
+			else 
+			{
+				$col = '';
+			}
 		}
 	} else {
 		if ( ($generic_type eq 'BLOB') || ($generic_type eq 'RAW') ) {
