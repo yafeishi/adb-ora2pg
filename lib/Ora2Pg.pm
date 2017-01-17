@@ -6645,6 +6645,7 @@ sub _create_foreign_keys
 =head2 _create_indexes_on_sub_table
 
 This function return SQL code to create parent index on sub_table
+add by danghb
 
 =cut
 
@@ -14617,7 +14618,6 @@ sub normalize_query
 sub _escape_lob
 {
 	my ($self, $col, $generic_type, $cond) = @_;
-
 	if ($self->{type} eq 'COPY') {
 		if ( ($generic_type eq 'BLOB') || ($generic_type eq 'RAW') ) {
 			#$col = escape_bytea($col);
