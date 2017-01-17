@@ -3504,6 +3504,11 @@ LANGUAGE plpgsql ;
 				$sql_output .= " MAXVALUE $seq->[2]";
 			}
 			$sql_output .= " START $seq->[4] CACHE $cache$cycle;\n";
+			if ( $seq->[4] < $seq->[1] )
+			{
+				print STDERR "Aborting. BECAUSE START WITH ($seq->[4]) cannot be less than MINVALUE ($seq->[1]) \n";
+				_exit(0);
+			}
 
 			if ($self->{force_owner}) {
 				my $owner = $seq->[7];
