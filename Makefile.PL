@@ -299,7 +299,9 @@ KEEP_PKEY_NAMES 0
 # create table statements. If disabled (the default) primary key definition
 # will be added with an alter table statement. Enable it if you are exporting
 # to GreenPlum PostgreSQL database.
-PKEY_IN_CREATE		0
+PKEY_IN_CREATE		1
+
+UKEY_IN_CREATE		1
 
 # This directive allow you to add an ON UPDATE CASCADE option to a foreign
 # key when a ON DELETE CASCADE is defined or always. Oracle do not support

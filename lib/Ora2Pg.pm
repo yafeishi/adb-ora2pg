@@ -1152,6 +1152,9 @@ sub _init
 	$self->{export_invalid} ||= 0;
 	$self->{use_reserved_words} ||= 0;
 	$self->{pkey_in_create} ||= 0;
+	#add by jiangmj3
+	$self->{ukey_in_create} ||= 0;
+	#add end
 	$self->{security} = ();
 	# Should we add SET ON_ERROR_STOP to generated SQL files
 	$self->{stop_on_error} = 1 if (not defined $self->{stop_on_error});
@@ -5672,6 +5675,12 @@ CREATE TRIGGER ${table}_trigger_insert
 			if ($self->{pkey_in_create}) {
 				$sql_output .= $self->_get_primary_keys($table, $self->{tables}{$table}{unique_key});
 			}
+			#add by jiangmj3
+			if ($self->{ukey_in_create}) {
+				$sql_output .= $self->_get_unique_keys($table, $self->{tables}{$table}{unique_key});
+			}
+			#add end
+			
 			$sql_output =~ s/,$//;
 			if ( ($self->{type} ne 'FDW') && (!$self->{external_to_fdw} || (!grep(/^$table$/i, keys %{$self->{external_table}}) && !$self->{tables}{$table}{table_info}{connection})) ) {
 				my $withoid = '';
@@ -5757,8 +5766,11 @@ CREATE TRIGGER ${table}_trigger_insert
 		}
 		if ($self->{type} ne 'FDW') {
 			# Set the unique (and primary) key definition
+			$self->logit("Dumping unique (and primary) key definition for table $table...\n", 1);
 			$constraints .= $self->_create_unique_keys($table, $self->{tables}{$table}{unique_key});
+			
 			# Set the check constraint definition
+			$self->logit("Dumping check constraint definition for table $table...\n", 1);
 			$constraints .= $self->_create_check_constraint($table, $self->{tables}{$table}{check_constraint},$self->{tables}{$table}{field_name});
 			if (!$self->{file_per_constraint}) {
 				$sql_output .= $constraints;
@@ -5769,9 +5781,22 @@ CREATE TRIGGER ${table}_trigger_insert
 			#add by jiangmj3 for create uniqure index 2017-01-16 "ERROR:  Cannot create index whose evaluation cannot be enforced to remote nodes"
 			$self->logit("Dumping index for table $table...\n", 1);
 			my $primary_keys .= $self->_get_primary_columms($table, $self->{tables}{$table}{unique_key});
-			$self->logit("Get primary keys ($primary_keys) and first column name($first_column_name) for table $table...\n", 1);
+			my $unique_keys  .= $self->_get_unique_columms($table, $self->{tables}{$table}{unique_key});
+			$self->logit("Get primary keys ($primary_keys) and first column name($first_column_name) and unique constraint ($unique_keys) for table $table...\n", 1);
 			my $unique_index_for_adb = '';
-			$primary_keys?($unique_index_for_adb .= $primary_keys):($unique_index_for_adb .= $first_column_name); 
+			if ( $primary_keys )
+			{
+				$unique_index_for_adb .= $primary_keys;
+			}
+			elsif ( $unique_keys )
+			{
+				$unique_index_for_adb .= $unique_keys;
+			}
+			else
+			{
+				$unique_index_for_adb .= $first_column_name;
+			}
+			#$primary_keys?($unique_index_for_adb .= $primary_keys):($unique_index_for_adb .= $first_column_name); 
 			my ($idx, $fts_idx) = $self->_create_indexes($table, 0,  $unique_index_for_adb, %{$self->{tables}{$table}{indexes}});
 			#add end
 			$indices .= "$idx\n" if ($idx);
@@ -6243,7 +6268,7 @@ CREATE TRIGGER $trig_name BEFORE INSERT OR UPDATE
 				my @array3_new =();
 				foreach my $item ( @array3 )
 				{
-					if ( ! grep( /$item/, @array3_new ) )
+					if ( ! grep( /^$item$/, @array3_new ) )
 					{
 						push( @array3_new, $item );
 					}
@@ -6411,6 +6436,65 @@ sub is_primary_key_column
 	return 0;
 }
 
+=head2 _get_unique_keys
+
+This function return SQL code to add primary keys of a create table definition
+
+=cut
+sub _get_unique_keys
+{
+	my ($self, $table, $unique_key) = @_;
+
+	my $out = '';
+
+	# Set the unique (and primary) key definition
+	foreach my $consname (keys %$unique_key) {
+		next if ($self->{pkey_in_create} && ($unique_key->{$consname}{type} ne 'U'));
+		my $constype =   $unique_key->{$consname}{type};
+		my $constgen =   $unique_key->{$consname}{generated};
+		my $index_name = $unique_key->{$consname}{index_name};
+		my @conscols = @{$unique_key->{$consname}{columns}};
+		my %constypenames = ('U' => 'UNIQUE', 'P' => 'PRIMARY KEY');
+		my $constypename = $constypenames{$constype};
+		for (my $i = 0; $i <= $#conscols; $i++) 
+		{
+			# Change column names
+			if (exists $self->{replaced_cols}{"\L$table\E"}{"\L$conscols[$i]\E"} && $self->{replaced_cols}{"\L$table\E"}{"\L$conscols[$i]\E"}) {
+				$conscols[$i] = $self->{replaced_cols}{"\L$table\E"}{"\L$conscols[$i]\E"};
+			}
+		}
+		map { s/"//gs } @conscols;
+		if (!$self->{preserve_case}) {
+			map { $_ = $self->quote_reserved_words($_) } @conscols;
+		} else {
+			map { s/^/"/; s/$/"/; } @conscols;
+		}
+		my $columnlist = join(',', @conscols);
+		if (!$self->{preserve_case}) {
+			$columnlist = lc($columnlist);
+		}
+		if ($columnlist) {
+			if ($self->{ukey_in_create}) {
+				if (!$self->{keep_pkey_names} || ($constgen eq 'GENERATED NAME')) 
+				{
+					$out .= "\tUNIQUE ($columnlist)";
+				} 
+				else 
+				{
+					$out .= "\tCONSTRAINT \L$consname\E UNIQUE ($columnlist)";
+				}
+				#if ($self->{use_tablespace} && $self->{tables}{$table}{idx_tbsp}{$index_name} && !grep(/^$self->{tables}{$table}{idx_tbsp}{$index_name}$/i, @{$self->{default_tablespaces}})) 
+				#{
+				#	$out .= " USING INDEX TABLESPACE $self->{tables}{$table}{idx_tbsp}{$index_name}";
+				#}
+				$out .= ",\n";
+			}
+		}
+	}
+	$out =~ s/,$//s;
+
+	return $out;
+}
 
 =head2 _get_primary_keys
 
@@ -6466,6 +6550,55 @@ sub _get_primary_keys
 
 	return $out;
 }
+
+=head2 _get_unique_columms
+
+This function return Columms to add unique keys of a create index definition
+
+=cut
+sub _get_unique_columms
+{
+	my ($self, $table, $unique_key) = @_;
+
+	my $out = '';
+
+	# Set the unique (and primary) key definition 
+	foreach my $consname (keys %$unique_key) {
+		next if ($self->{ukey_in_create} && ($unique_key->{$consname}{type} ne 'U'));
+		my $constype =   $unique_key->{$consname}{type};
+		my $constgen =   $unique_key->{$consname}{generated};
+		my $index_name = $unique_key->{$consname}{index_name};
+		my @conscols = @{$unique_key->{$consname}{columns}};
+		my %constypenames = ('U' => 'UNIQUE', 'P' => 'PRIMARY KEY');
+		my $constypename = $constypenames{$constype};
+		for (my $i = 0; $i <= $#conscols; $i++) {
+			# Change column names
+			if (exists $self->{replaced_cols}{"\L$table\E"}{"\L$conscols[$i]\E"} && $self->{replaced_cols}{"\L$table\E"}{"\L$conscols[$i]\E"}) {
+				$conscols[$i] = $self->{replaced_cols}{"\L$table\E"}{"\L$conscols[$i]\E"};
+			}
+		}
+		map { s/"//gs } @conscols;
+		if (!$self->{preserve_case}) {
+			map { $_ = $self->quote_reserved_words($_) } @conscols;
+		} else {
+			map { s/^/"/; s/$/"/; } @conscols;
+		}
+		my $columnlist = join(',', @conscols);
+		if (!$self->{preserve_case}) {
+			$columnlist = lc($columnlist);
+		}
+		if ($columnlist) 
+		{
+			$out .= "$columnlist";
+			$out .= ",";
+		}
+	}
+	$out =~ s/,$//s;
+
+	return $out;
+}
+
+
 
 =head2 _get_primary_columms
 
@@ -6531,7 +6664,7 @@ sub _create_unique_keys
 
 	# Set the unique (and primary) key definition
 	foreach my $consname (keys %$unique_key) {
-		next if ($self->{pkey_in_create} && ($unique_key->{$consname}{type} eq 'P'));
+		next if ( ($self->{pkey_in_create} && ($unique_key->{$consname}{type} eq 'P') ) || ( $self->{ukey_in_create} && ($unique_key->{$consname}{type} eq 'U') ) );
 		my $constype =   $unique_key->{$consname}{type};
 		my $constgen =   $unique_key->{$consname}{generated};
 		my $index_name = $unique_key->{$consname}{index_name};
