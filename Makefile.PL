@@ -480,7 +480,11 @@ FILE_PER_INDEX		0
 # corresponding configuration directive. You can use .gz xor .bz2
 # extension to enable compression. Default is to save all data in one
 # file. This is usable only during INSERT or COPY export type.
-FILE_PER_TABLE	0
+FILE_PER_TABLE	1
+
+#Add for ADB
+SPLIT_FILE      1
+
 
 # Allow function export to be saved in one file per function/procedure.
 # The files will be named as funcname_OUTPUT. Where OUTPUT is the value

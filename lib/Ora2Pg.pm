@@ -502,7 +502,9 @@ sub create_export_file
 			$self->{compress} = 'Bzip2';
 			$self->{fhout} = new IO::File;
 			$self->{fhout}->open("|$self->{bzip2} --stdout >$outfile") or $self->logit("FATAL: Can't open pipe to $self->{bzip2} --stdout >$outfile: $!\n", 0, 1);
-		} else {
+		} 
+		else 
+		{
 			$self->{fhout} = new IO::File;
 			$self->{fhout}->open(">>$outfile") or $self->logit("FATAL: Can't open $outfile: $!\n", 0, 1);
 		}
@@ -520,11 +522,14 @@ sub remove_export_file
 
 	# Init with configuration OUTPUT filename
 	$outfile ||= $self->{output};
-	if ($self->{input_file} && ($outfile eq $self->{input_file})) {
+	if ($self->{input_file} && ($outfile eq $self->{input_file})) 
+	{
 		$self->logit("FATAL: input file is the same as output file: $outfile, can not overwrite it.\n",0,1);
 	}
-	if ($outfile) {
-		if ($self->{output_dir} && $outfile) {
+	if ($outfile) 
+	{
+		if ($self->{output_dir} && $outfile) 
+		{
 			$outfile = $self->{output_dir} . "/" . $outfile;
 		}
 		unlink($outfile);
@@ -544,14 +549,18 @@ sub append_export_file
 
 	my $filehdl = undef;
 
-	if ($outfile) {
+	if ($outfile) 
+	{
 		if ($self->{output_dir} && !$noprefix) {
 			$outfile = $self->{output_dir} . '/' . $outfile;
 		}
 		# If user request data compression
-		if ($self->{compress}) {
+		if ($self->{compress}) 
+		{
 			die "FATAL: you can't use compressed output with parallel dump\n";
-		} else {
+		} 
+		else 
+		{
 			$filehdl = new IO::File;
 			$filehdl->open(">>$outfile") or $self->logit("FATAL: Can't open $outfile: $!\n", 0, 1);
 			$filehdl->autoflush(1);
@@ -1154,6 +1163,7 @@ sub _init
 	$self->{pkey_in_create} ||= 0;
 	#add by jiangmj3
 	$self->{ukey_in_create} ||= 0;
+	$self->{split_file} 	||= 0;
 	#add end
 	$self->{security} = ();
 	# Should we add SET ON_ERROR_STOP to generated SQL files
@@ -2839,19 +2849,29 @@ sub _export_table_data
 	my $tmptb = $self->get_replaced_tbname($table);
 
 	# Open output file
-	$self->data_dump($sql_header, $table) if (!$self->{pg_dsn} && $self->{file_per_table});
+	if ( !$self->{split_file} )
+	{
+		$self->data_dump($sql_header, $table) if (!$self->{pg_dsn} && $self->{file_per_table});
+	}
+	
 
 	my $total_record = 0;
 
 	# When copy freeze is required, force a transaction with a truncate
-	if ($self->{copy_freeze} && !$self->{pg_dsn}) {
+	if ($self->{copy_freeze} && !$self->{pg_dsn}) 
+	{
 		$self->{truncate_table} = 1;
-		if ($self->{file_per_table}) {
+		if ($self->{file_per_table}) 
+		{
 			$self->data_dump("BEGIN;\n",  $table);
-		} else {
+		} 
+		else 
+		{
 			$self->dump("\nBEGIN;\n");
 		}
-	} else {
+	} 
+	else 
+	{
 		$self->{copy_freeze} = '';
 	}
 
@@ -2907,8 +2927,10 @@ sub _export_table_data
 	}
 
 	# With partitioned table, load data direct from table partition
-	if (exists $self->{partitions}{$table}) {
-		foreach my $pos (sort {$self->{partitions}{$table}{$a} <=> $self->{partitions}{$table}{$b}} keys %{$self->{partitions}{$table}}) {
+	if (exists $self->{partitions}{$table}) 
+	{
+		foreach my $pos (sort {$self->{partitions}{$table}{$a} <=> $self->{partitions}{$table}{$b}} keys %{$self->{partitions}{$table}}) 
+		{
 			foreach my $part_name (sort {$self->{partitions}{$table}{$pos}{$a}->{'colpos'} <=> $self->{partitions}{$table}{$pos}{$b}->{'colpos'}} keys %{$self->{partitions}{$table}{$pos}}) {
 				my $tbpart_name = $part_name;
 				$tbpart_name = $table . '_' . $part_name if ($self->{prefix_partition});
@@ -2924,7 +2946,8 @@ sub _export_table_data
 			}
 		}
 		# Now load content of the default partition table
-		if ($self->{partitions_default}{$table}) {
+		if ($self->{partitions_default}{$table}) 
+		{
 			if (!$self->{allow_partition} || grep($_ =~ /^$self->{partitions_default}{$table}$/i, @{$self->{allow_partition}})) {
 				if ($self->{file_per_table} && !$self->{pg_dsn}) {
 					# Do not dump data again if the file already exists
@@ -2936,8 +2959,9 @@ sub _export_table_data
 				}
 			}
 		}
-	} else {
-
+	} 
+	else 
+	{
 		$total_record = $self->_dump_table($dirprefix, $sql_header, $table);
 	}
 
@@ -5893,7 +5917,8 @@ sub _dump_table
 
 	# Set search path
 	my $search_path = $self->set_search_path();
-	if ($search_path) {
+	if ($search_path) 
+	{
 		push(@cmd_head,$search_path);
 	}
 
@@ -5901,9 +5926,12 @@ sub _dump_table
 	my $tmptb = '';
 
 	# Prefix partition name with tablename
-	if ($part_name && $self->{prefix_partition}) {
+	if ($part_name && $self->{prefix_partition}) 
+	{
 		$tmptb = $self->get_replaced_tbname($table . '_' . $part_name);
-	} else {
+	} 
+	else 
+	{
 		$tmptb = $self->get_replaced_tbname($part_name || $table);
 	}
 
@@ -5916,7 +5944,8 @@ sub _dump_table
 
 	# Extract column information following the Oracle position order
 	my @fname = ();
-	foreach my $i ( 0 .. $#{$self->{tables}{$table}{field_name}} ) {
+	foreach my $i ( 0 .. $#{$self->{tables}{$table}{field_name}} ) 
+	{
 		my $fieldname = ${$self->{tables}{$table}{field_name}}[$i];
 		if (!$self->{preserve_case}) {
 			if (exists $self->{modify}{"\L$table\E"}) {
@@ -5927,9 +5956,12 @@ sub _dump_table
 				next if (!grep(/^$fieldname$/i, @{$self->{modify}{"$table"}}));
 			}
 		}
-		if (!$self->{preserve_case}) {
+		if (!$self->{preserve_case}) 
+		{
 			push(@fname, lc($fieldname));
-		} else {
+		} 
+		else 
+		{
 			push(@fname, $fieldname);
 		}
 
@@ -5977,7 +6009,8 @@ sub _dump_table
 	}
 
 	my $sprep = '';
-	if ($self->{pg_dsn}) {
+	if ($self->{pg_dsn}) 
+	{
 		if ($self->{type} ne 'COPY') {
 			$s_out .= '?,' foreach (@fname);
 			$s_out =~ s/,$//;
@@ -5987,7 +6020,7 @@ sub _dump_table
 	}
 
 	# Extract all data from the current table
-	my $total_record = $self->ask_for_data($table, \@cmd_head, \@cmd_foot, $s_out, \@nn, \@tt, $sprep, \@stt, $part_name);
+	my $total_record = $self->ask_for_data($table, $sql_header, \@cmd_head, \@cmd_foot, $s_out, \@nn, \@tt, $sprep, \@stt, $part_name);
 
 	$self->{type} = $self->{local_type} if ($self->{local_type});
 	$self->{local_type} = '';
@@ -7053,7 +7086,8 @@ sub _howto_get_data
 			}
 
 			# With INSERT statement we always use WKT
-			if ($self->{type} eq 'INSERT') {
+			if ($self->{type} eq 'INSERT') 
+			{
 				if ($self->{geometry_extract_type} eq 'WKB') {
 					$str .= "CASE WHEN $name->[$k]->[0] IS NOT NULL THEN SDO_UTIL.TO_WKBGEOMETRY($name->[$k]->[0]) ELSE NULL END,";
 				} elsif ($self->{geometry_extract_type} eq 'INTERNAL') {
@@ -7061,7 +7095,8 @@ sub _howto_get_data
 				} else {
 					$str .= "CASE WHEN $name->[$k]->[0] IS NOT NULL THEN 'ST_GeomFromText('''||SDO_UTIL.TO_WKTGEOMETRY($name->[$k]->[0])||''','||($spatial_srid)||')' ELSE NULL END,";
 				}
-			} else {
+			} 
+			else {
 				if ($self->{geometry_extract_type} eq 'WKB') {
 					$str .= "CASE WHEN $name->[$k]->[0] IS NOT NULL THEN SDO_UTIL.TO_WKBGEOMETRY($name->[$k]->[0]) ELSE NULL END,";
 				} elsif ($self->{geometry_extract_type} eq 'INTERNAL') {
@@ -9704,43 +9739,93 @@ File is open and locked before writind data, it is closed at end.
 
 sub data_dump
 {
-	my ($self, $data, $tname, $pname) = @_;
+	my ($self, $data, $tname, $pname, $fileno) = @_;
+	#add by jiangmj3
+	#当使用ora2pg -c ora2pg_MON.conf  -o ~/aaa.sql -d 输出路径中带有绝对路径时候会出错
+	#----------dirprefix=, filename=/root/aaa.sql----------
+	#Dumping data from TEST to file: TEST_/root/aaa.sql
+	#FATAL: Can't open tmp_TEST_/root/aaa.sql: No such file or directory
+	#Aborting export...
 
+	#add end
 	my $dirprefix = '';
 	$dirprefix = "$self->{output_dir}/" if ($self->{output_dir});
 	my $filename = $self->{output};
 	my $rname = $pname || $tname;
-	if ($self->{file_per_table}) {
+	if ($self->{file_per_table}) 
+	{
 		$filename = "${rname}_$self->{output}";
 		$filename = "tmp_$filename";
 	}
 	# Set file temporary until the table export is done
-	$self->logit("Dumping data from $rname to file: $dirprefix${rname}_$self->{output}\n", 1);
+	if ( ! $self->{split_file} )
+	{
+		$self->logit("Dumping data from $rname to file: $dirprefix${rname}_$self->{output}\n", 1);
+	}
 
-	if ( ($self->{jobs} > 1) || ($self->{oracle_copies} > 1) ) {
+	if ( ($self->{jobs} > 1) || ($self->{oracle_copies} > 1) ) 
+	{
 		$self->{fhout}->close() if (defined $self->{fhout} && !$self->{file_per_table} && !$self->{pg_dsn});
+		
 		my $fh = $self->append_export_file($filename);
 		flock($fh, 2) || die "FATAL: can't lock file $dirprefix$filename\n";
+		
 		$fh->print($data);
 		$self->close_export_file($fh);
 		$self->logit("Written " . length($data) . " bytes to $dirprefix$filename\n", 1);
 		# Reopen default output file
 		$self->create_export_file() if (defined $self->{fhout} && !$self->{file_per_table} && !$self->{pg_dsn});
-	} elsif ($self->{file_per_table}) {
-		if ($self->{file_per_table} && $pname) {
-			my $fh = $self->append_export_file($filename);
+	} 
+	elsif ($self->{file_per_table}) 
+	{
+		my $fh = undef;
+		if ($self->{file_per_table} && $pname) 
+		{
+			#获得文件句柄
+			$fh = $self->append_export_file($filename);
+			
+			#写入头文件
+			
+			#写入数据
 			$fh->print($data);
+			
+			#写入尾部
+			#关闭文件句柄
 			$self->close_export_file($fh);
 			$self->logit("Written " . length($data) . " bytes to $dirprefix$filename\n", 1);
-		} else {
-			$self->{cfhout} = $self->open_export_file($filename) if (!defined $self->{cfhout});
-			if ($self->{compress} eq 'Zlib') {
-				$self->{cfhout}->gzwrite($data) or $self->logit("FATAL: error writing compressed data\n", 0, 1);
-			} else {
-				$self->{cfhout}->print($data);
+		} 
+		else 
+		{
+			if( ! $self->{split_file} )
+			{
+				$self->{cfhout} = $self->open_export_file($filename) if (!defined $self->{cfhout});
+				if ($self->{compress} eq 'Zlib') 
+				{
+					$self->{cfhout}->gzwrite($data) or $self->logit("FATAL: error writing compressed data\n", 0, 1);
+				} 
+				else 
+				{
+					$self->{cfhout}->print($data);
+				}
+			}
+			else
+			{
+				#打开文件
+				$filename .= "_" . $fileno;
+				$self->logit("Dumping data from $rname to file: $filename\n", 1);
+				$fh = $self->open_export_file($filename);
+				
+				#写入头信息 set client begin；
+				$fh->print($data);
+				
+				#关闭文件
+				$self->close_export_file($fh);
+				
 			}
 		}
-	} else {
+	} 
+	else 
+	{
 		$self->dump($data);
 	}
 
@@ -10754,18 +10839,22 @@ CREATE TYPE \L$type_name\E AS ($type_name $declar\[$size\]);
 
 sub ask_for_data
 {
-	my ($self, $table, $cmd_head, $cmd_foot, $s_out, $nn, $tt, $sprep, $stt, $part_name) = @_;
+	my ($self, $table, $sql_header, $cmd_head, $cmd_foot, $s_out, $nn, $tt, $sprep, $stt, $part_name) = @_;
 
 	# Build SQL query to retrieve data from this table
-	if (!$part_name) {
+	if (!$part_name) 
+	{
 		$self->logit("Looking how to retrieve data from $table...\n", 1);
-	} else {
+	} 
+	else 
+	{
 		$self->logit("Looking how to retrieve data from $table partition $part_name...\n", 1);
 	}
 	my $query = $self->_howto_get_data($table, $nn, $tt, $stt, $part_name);
 
 	# Check for boolean rewritting
-	for (my $i = 0; $i <= $#{$nn}; $i++) {
+	for (my $i = 0; $i <= $#{$nn}; $i++) 
+	{
 		my $colname = $nn->[$i]->[0];
 		$colname =~ s/["`]//g;
 		my $typlen = $nn->[$i]->[5];
@@ -10780,23 +10869,28 @@ sub ask_for_data
 	}
 
 	# check if destination column type must be changed
-	for (my $i = 0; $i <= $#{$nn}; $i++) {
+	for (my $i = 0; $i <= $#{$nn}; $i++) 
+	{
 		my $colname = $nn->[$i]->[0];
 		$colname =~ s/["`]//g;
 		$tt->[$i] = $self->{'modify_type'}{"\L$table\E"}{"\L$colname\E"} if (exists $self->{'modify_type'}{"\L$table\E"}{"\L$colname\E"});
 	}
 
-	if ( ($self->{oracle_copies} > 1) && $self->{defined_pk}{"\L$table\E"} ) {
+	if ( ($self->{oracle_copies} > 1) && $self->{defined_pk}{"\L$table\E"} ) 
+	{
 		$self->{ora_conn_count} = 0;
-		while ($self->{ora_conn_count} < $self->{oracle_copies}) {
-			spawn sub {
+		while ($self->{ora_conn_count} < $self->{oracle_copies}) 
+		{
+			spawn sub 
+			{
 				$self->logit("Creating new connection to database to extract data...\n", 1);
-				$self->_extract_data($query, $table, $cmd_head, $cmd_foot, $s_out, $nn, $tt, $sprep, $stt, $part_name, $self->{ora_conn_count});
+				$self->_extract_data($query, $table, $sql_header, $cmd_head, $cmd_foot, $s_out, $nn, $tt, $sprep, $stt, $part_name, $self->{ora_conn_count});
 			};
 			$self->{ora_conn_count}++;
 		}
 		# Wait for oracle connection terminaison
-		while ($self->{ora_conn_count} > 0) {
+		while ($self->{ora_conn_count} > 0) 
+		{
 			my $kid = waitpid(-1, WNOHANG);
 			if ($kid > 0) {
 				$self->{ora_conn_count}--;
@@ -10804,13 +10898,16 @@ sub ask_for_data
 			}
 			usleep(500000);
 		}
-		if (defined $pipe) {
+		if (defined $pipe) 
+		{
 			my $t_name = $part_name || $table;
 			my $t_time = time();
 			$pipe->print("TABLE EXPORT ENDED: $t_name, end: $t_time, report all parts\n");
 		}
-	} else {
-		my $total_record = $self->_extract_data($query, $table, $cmd_head, $cmd_foot, $s_out, $nn, $tt, $sprep, $stt, $part_name);
+	} 
+	else 
+	{
+		my $total_record = $self->_extract_data($query, $table, $sql_header, $cmd_head, $cmd_foot, $s_out, $nn, $tt, $sprep, $stt, $part_name);
 		# Only useful for single process
 		return $total_record;
 	}
@@ -10820,7 +10917,7 @@ sub ask_for_data
 
 sub _extract_data
 {
-	my ($self, $query, $table, $cmd_head, $cmd_foot, $s_out, $nn, $tt, $sprep, $stt, $part_name, $proc) = @_;
+	my ($self, $query, $table, $sql_header, $cmd_head, $cmd_foot, $s_out, $nn, $tt, $sprep, $stt, $part_name, $proc) = @_;
 
 	$0 = "ora2pg - querying table $table";
 
@@ -10975,25 +11072,33 @@ sub _extract_data
 	}
 
 	# Oracle allow direct retreiving of bchunk of data
-	if (!$self->{is_mysql}) {
+	if (!$self->{is_mysql}) 
+	{
 
 		my $data_limit = $self->{data_limit};
-		if (exists $self->{local_data_limit}{$table}) {
+		if (exists $self->{local_data_limit}{$table}) 
+		{
 			$data_limit = $self->{local_data_limit}{$table};
 		}
 		my $has_blob = 0;
 		$has_blob = 1 if (grep(/LOB/, @$stt));
 
-		if (!$has_blob || $self->{no_lob_locator}) {
-
-			while ( my $rows = $sth->fetchall_arrayref(undef,$data_limit)) {
-
-				if ( ($self->{parallel_tables} > 1) || (($self->{oracle_copies} > 1) && $self->{defined_pk}{"\L$table\E"}) ) {
+		if (!$has_blob || $self->{no_lob_locator}) 
+		{
+			#处理所有的记录
+			my $file_no = 0;
+			while ( my $rows = $sth->fetchall_arrayref(undef,$data_limit)) 
+			{
+				$file_no++;
+				if ( ($self->{parallel_tables} > 1) || (($self->{oracle_copies} > 1) && $self->{defined_pk}{"\L$table\E"}) ) 
+				{
 					if ($dbh->errstr) {
 						$self->logit("ERROR: " . $dbh->errstr . "\n", 0, 0);
 						last;
 					}
-				} elsif ( $self->{dbh}->errstr ) {
+				} 
+				elsif ( $self->{dbh}->errstr ) 
+				{
 					$self->logit("ERROR: " . $self->{dbh}->errstr . "\n", 0, 0);
 					last;
 				}
@@ -11001,27 +11106,40 @@ sub _extract_data
 				$total_record += @$rows;
 				$self->{current_total_row} += @$rows;
 
-				if ( ($self->{jobs} > 1) || ($self->{oracle_copies} > 1) ) {
-					while ($self->{child_count} >= $self->{jobs}) {
+				if ( ($self->{jobs} > 1) || ($self->{oracle_copies} > 1) ) 
+				{
+					while ($self->{child_count} >= $self->{jobs}) 
+					{
 						my $kid = waitpid(-1, WNOHANG);
-						if ($kid > 0) {
+						if ($kid > 0) 
+						{
 							$self->{child_count}--;
 							delete $RUNNING_PIDS{$kid};
 						}
 						usleep(50000);
 					}
-					spawn sub {
-						$self->_dump_to_pg($proc, $rows, $table, $cmd_head, $cmd_foot, $s_out, $tt, $sprep, $stt, $start_time, $part_name, $total_record, %user_type);
+					spawn sub 
+					{
+						my $file_no = 0;
+						$self->_dump_to_pg($proc, $rows, $table, $sql_header, $cmd_head, $cmd_foot, $s_out, $tt, $sprep, $stt, $start_time, $part_name, $total_record, $file_no, %user_type);
 					};
 					$self->{child_count}++;
-				} else {
-					$self->_dump_to_pg($proc, $rows, $table, $cmd_head, $cmd_foot, $s_out, $tt, $sprep, $stt, $start_time, $part_name, $total_record, %user_type);
+				} 
+				else 
+				{
+					$self->logit("begin to call _dump_to_pg----------\n");
+					if ( $total_record != 0)
+					{
+						$self->_dump_to_pg($proc, $rows, $table, $sql_header, $cmd_head, $cmd_foot, $s_out, $tt, $sprep, $stt, $start_time, $part_name, $total_record, $file_no,%user_type);
+					}
+					
+					
 				}
-
-
 			}
 
-		} else {
+		} 
+		else 
+		{
 
 			my @rows = ();
 			while ( my @row = $sth->fetchrow_array()) {
@@ -11093,12 +11211,17 @@ sub _extract_data
 							}
 							usleep(50000);
 						}
-						spawn sub {
-							$self->_dump_to_pg($proc, \@rows, $table, $cmd_head, $cmd_foot, $s_out, $tt, $sprep, $stt, $start_time, $part_name, $total_record, %user_type);
+						spawn sub 
+						{
+							my $file_no = 0;
+							$self->_dump_to_pg($proc, \@rows, $table, $sql_header, $cmd_head, $cmd_foot, $s_out, $tt, $sprep, $stt, $start_time, $part_name, $total_record, $file_no, %user_type);
 						};
 						$self->{child_count}++;
-					} else {
-						$self->_dump_to_pg($proc, \@rows, $table, $cmd_head, $cmd_foot, $s_out, $tt, $sprep, $stt, $start_time, $part_name, $total_record, %user_type);
+					} 
+					else 
+					{
+						my $file_no = 0;
+						$self->_dump_to_pg($proc, \@rows, $table, $sql_header, $cmd_head, $cmd_foot, $s_out, $tt, $sprep, $stt, $start_time, $part_name, $total_record, $file_no, %user_type);
 					}
 					@rows = ();
 				}
@@ -11112,25 +11235,34 @@ sub _extract_data
 					}
 					usleep(50000);
 				}
-				spawn sub {
-					$self->_dump_to_pg($proc, \@rows, $table, $cmd_head, $cmd_foot, $s_out, $tt, $sprep, $stt, $start_time, $part_name, $total_record, %user_type);
+				spawn sub 
+				{
+					my $file_no = 0;
+					$self->_dump_to_pg($proc, \@rows, $table, $sql_header, $cmd_head, $cmd_foot, $s_out, $tt, $sprep, $stt, $start_time, $part_name, $total_record, $file_no,%user_type);
 				};
 				$self->{child_count}++;
-			} else {
-				$self->_dump_to_pg($proc, \@rows, $table, $cmd_head, $cmd_foot, $s_out, $tt, $sprep, $stt, $start_time, $part_name, $total_record, %user_type);
+			} 
+			else 
+			{
+				my $file_no = 0;
+				$self->_dump_to_pg($proc, \@rows, $table, $sql_header, $cmd_head, $cmd_foot, $s_out, $tt, $sprep, $stt, $start_time, $part_name, $total_record, $file_no, %user_type);
 			}
 			@rows = ();
 
 		}
 
-	} else {
+	} 
+	else 
+	{
 
 		my @rows = ();
 		my $num_row = 0;
-		while (my @row = $sth->fetchrow())  {
+		while (my @row = $sth->fetchrow())  
+		{
 			push(@rows, \@row);
 			$num_row++;
-			if ($num_row == $self->{data_limit}) {
+			if ($num_row == $self->{data_limit}) 
+			{
 				$num_row  = 0;
 				$total_record += @rows;
 				$self->{current_total_row} += @rows;
@@ -11144,12 +11276,17 @@ sub _extract_data
 						}
 						usleep(50000);
 					}
-					spawn sub {
-						$self->_dump_to_pg($proc, \@rows, $table, $cmd_head, $cmd_foot, $s_out, $tt, $sprep, $stt, $start_time, $part_name, $total_record, %user_type);
+					spawn sub 
+					{
+						my $file_no = 0;
+						$self->_dump_to_pg($proc, \@rows, $table, $sql_header, $cmd_head, $cmd_foot, $s_out, $tt, $sprep, $stt, $start_time, $part_name, $total_record, $file_no, %user_type);
 					};
 					$self->{child_count}++;
-				} else {
-					$self->_dump_to_pg($proc, \@rows, $table, $cmd_head, $cmd_foot, $s_out, $tt, $sprep, $stt, $start_time, $part_name, $total_record, %user_type);
+				} 
+				else 
+				{
+					my $file_no = 0;
+					$self->_dump_to_pg($proc, \@rows, $table, $sql_header, $cmd_head, $cmd_foot, $s_out, $tt, $sprep, $stt, $start_time, $part_name, $total_record, $file_no,%user_type);
 				}
 				@rows = ();
 			}
@@ -11168,12 +11305,17 @@ sub _extract_data
 					}
 					usleep(50000);
 				}
-				spawn sub {
-					$self->_dump_to_pg($proc, \@rows, $table, $cmd_head, $cmd_foot, $s_out, $tt, $sprep, $stt, $start_time, $part_name, $total_record, %user_type);
+				spawn sub 
+				{
+					my $file_no = 0;
+					$self->_dump_to_pg($proc, \@rows, $table, $sql_header, $cmd_head, $cmd_foot, $s_out, $tt, $sprep, $stt, $start_time, $part_name, $total_record, $file_no, %user_type);
 				};
 				$self->{child_count}++;
-			} else {
-				$self->_dump_to_pg($proc, \@rows, $table, $cmd_head, $cmd_foot, $s_out, $tt, $sprep, $stt, $start_time, $part_name, $total_record, %user_type);
+			} 
+			else 
+			{
+				my $file_no = 0;
+				$self->_dump_to_pg($proc, \@rows, $table, $sql_header, $cmd_head, $cmd_foot, $s_out, $tt, $sprep, $stt, $start_time, $part_name, $total_record, $file_no ,%user_type);
 			}
 
 		}
@@ -11256,11 +11398,12 @@ sub log_error_insert
 
 sub _dump_to_pg
 {
-	my ($self, $procnum, $rows, $table, $cmd_head, $cmd_foot, $s_out, $tt, $sprep, $stt, $ora_start_time, $part_name, $glob_total_record, %user_type) = @_;
+	my ($self, $procnum, $rows, $table, $sql_header,$cmd_head, $cmd_foot, $s_out, $tt, $sprep, $stt, $ora_start_time, $part_name, $glob_total_record, $file_no,%user_type) = @_;
 
 	my @tempfiles = ();
 
-	if ($^O !~ /MSWin32|dos/i) {
+	if ($^O !~ /MSWin32|dos/i) 
+	{
 		push(@tempfiles, [ tempfile('tmp_ora2pgXXXXXX', SUFFIX => '', DIR => $TMP_DIR, UNLINK => 1 ) ]);
 	}
 
@@ -11288,28 +11431,38 @@ sub _dump_to_pg
 
 	# Build header of the file
 	my $h_towrite = '';
-	foreach my $cmd (@$cmd_head) {
-		if ($self->{pg_dsn}) {
+	foreach my $cmd (@$cmd_head) 
+	{
+		if ($self->{pg_dsn}) 
+		{
 			my $s = $dbhdest->do("$cmd") or $self->logit("FATAL: " . $dbhdest->errstr . "\n", 0, 1);
-		} else {
+		} 
+		else 
+		{
 			$h_towrite .= "$cmd\n";
 		}
 	}
 
 	# Build footer of the file
 	my $e_towrite = '';
-	foreach my $cmd (@$cmd_foot) {
-		if ($self->{pg_dsn}) {
+	foreach my $cmd (@$cmd_foot) 
+	{
+		if ($self->{pg_dsn}) 
+		{
 			my $s = $dbhdest->do("$cmd") or $self->logit("FATAL: " . $dbhdest->errstr . "\n", 0, 1);
-		} else {
+		} 
+		else 
+		{
 			$e_towrite .= "$cmd\n";
 		}
 	}
 
 	# Preparing data for output
-	if (!$sprep) {
+	if (!$sprep) 
+	{
 		my $data_limit = $self->{data_limit};
-		if (exists $self->{local_data_limit}{$table}) {
+		if (exists $self->{local_data_limit}{$table}) 
+		{
 			$data_limit = $self->{local_data_limit}{$table};
 		}
 		$self->logit("DEBUG: Formatting bulk of $data_limit data for PostgreSQL.\n", 1);
@@ -11321,12 +11474,15 @@ sub _dump_to_pg
 
 	# Creating output
 	my $data_limit = $self->{data_limit};
-	if (exists $self->{local_data_limit}{$table}) {
+	if (exists $self->{local_data_limit}{$table}) 
+	{
 		$data_limit = $self->{local_data_limit}{$table};
 	}
 	$self->logit("DEBUG: Creating output for $data_limit tuples\n", 1);
-	if ($self->{type} eq 'COPY') {
-		if ($self->{pg_dsn}) {
+	if ($self->{type} eq 'COPY') 
+	{
+		if ($self->{pg_dsn}) 
+		{
 			$sql_out =~ s/;$//;
 			$self->logit("DEBUG: Sending COPY bulk output directly to PostgreSQL backend\n", 1);
 			my $s = $dbhdest->do($sql_out) or $self->logit("FATAL: " . $dbhdest->errstr . "\n", 0, 1);
@@ -11352,12 +11508,16 @@ sub _dump_to_pg
 					$self->logit("FATAL: " . $dbhdest->errstr . "\n", 0, 1);
 				}
 			}
-		} else {
+		} 
+		else 
+		{
 			# then add data to the output
 			map { $sql_out .= join("\t", @$_) . "\n"; } @$rows;
 			$sql_out .= "\\.\n";
 		}
-	} elsif (!$sprep) {
+	}
+	elsif (!$sprep) 
+	{
 		$sql_out = '';
 		foreach my $row (@$rows) {
 			$sql_out .= $s_out;
@@ -11366,9 +11526,12 @@ sub _dump_to_pg
 	}
 
 	# Insert data if we are in online processing mode
-	if ($self->{pg_dsn}) {
-		if ($self->{type} ne 'COPY') {
-			if (!$sprep) {
+	if ($self->{pg_dsn}) 
+	{
+		if ($self->{type} ne 'COPY') 
+		{
+			if (!$sprep) 
+			{
 				$self->logit("DEBUG: Sending INSERT output directly to PostgreSQL backend\n", 1);
 				unless($dbhdest->do($sql_out)) {
 					if ($self->{log_on_error}) {
@@ -11425,29 +11588,43 @@ sub _dump_to_pg
 				$ps->finish();
 			}
 		}
-	} else {
-		if ($part_name && $self->{prefix_partition})  {
+	} 
+	else 
+	{
+		if ($part_name && $self->{prefix_partition})  
+		{
 			$part_name = $table . '_' . $part_name;
 		}
-		$self->data_dump($h_towrite . $sql_out . $e_towrite, $table, $part_name);
+		$self->logit("part_name=$part_name, h_towrite=$h_towrite, e_towrite=$e_towrite, sql_out=$sql_out, table=$table\n");
+		#if($self->{split_file})
+		#{
+			$self->data_dump($h_towrite . $sql_header . $sql_out . $e_towrite, $table, $part_name, $file_no);
+		#}
+		#else
+		#{
+		#	$self->data_dump($h_towrite . $sql_out . $e_towrite, $table, $part_name);
+		#}
+		
 	}
 
 	my $total_row = $self->{tables}{$table}{table_info}{num_rows};
 	my $tt_record = @$rows;
 	$dbhdest->disconnect() if ($dbhdest);
 
-        # Set file temporary until the table export is done
-        my $filename = $self->{output};
-        if ($self->{file_per_table}) {
-                $filename = "${rname}_$self->{output}";
-        }
+    # Set file temporary until the table export is done
+    my $filename = $self->{output};
+    if ($self->{file_per_table}) 
+	{
+		$filename = "${rname}_$self->{output}";
+    }
 
 	my $end_time = time();
 	$ora_start_time = $end_time if (!$ora_start_time);
 	my $dt = $end_time - $ora_start_time;
 	my $rps = int($glob_total_record / ($dt||1));
 	my $t_name = $part_name || $table;
-	if (!$self->{quiet} && !$self->{debug}) {
+	if (!$self->{quiet} && !$self->{debug}) 
+	{
 		# Send current table in progress
 		if (defined $pipe) {
 			if ($procnum ne '') {
@@ -11458,11 +11635,14 @@ sub _dump_to_pg
 		} else {
 			print STDERR $self->progress_bar($glob_total_record, $total_row, 25, '=', 'rows', "Table $t_name ($rps recs/sec)"), "\r";
 		}
-	} elsif ($self->{debug}) {
+	} 
+	elsif ($self->{debug}) 
+	{
 		$self->logit("Extracted records from table $t_name: total_records = $glob_total_record (avg: $rps recs/sec)\n", 1);
 	}
 
-	if ($^O !~ /MSWin32|dos/i) {
+	if ($^O !~ /MSWin32|dos/i) 
+	{
 		if (defined $tempfiles[0]->[0]) {
 			close($tempfiles[0]->[0]);
 		}
