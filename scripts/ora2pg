@@ -208,8 +208,9 @@ if( $DISTRIBUTE_BY_MODE ne '')
 }
 # Validate  WHERE_OPTION
 $WHERE_OPTION = uc($WHERE_OPTION);
+my $var = $WHERE_OPTION;
 my %where_config = ();
-while ($WHERE_OPTION =~ s/([^\[\s]+)\s*\[([^\]]+)\]\s*//) 
+while ($var =~ s/([^\[\s]+)\s*\[([^\]]+)\]\s*//) 
 {
 	my $table = $1;
 	my $where = $2;
@@ -217,9 +218,9 @@ while ($WHERE_OPTION =~ s/([^\[\s]+)\s*\[([^\]]+)\]\s*//)
 	$where =~ s/\s+$//;
 	$where_config{where}{"\L$table\E"} = $where;
 }
-if ($WHERE_OPTION) 
+if ($var) 
 {
-	$where_config{global_where} = $WHERE_OPTION;
+	$where_config{global_where} = $var;
 }
 
 if(! %where_config)
