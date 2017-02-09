@@ -196,7 +196,7 @@ if ($FILE_CONF && ! -e $FILE_CONF) {
 push(@CAPABILITIES, @SCHEMA_ARRAY, @REPORT_ARRAY, @DATA_ARRAY, @EXTERNAL_ARRAY, @TEST_ARRAY);
 
 # add by jiangmj3
-# Validate export type
+# Validate  distribute_by_mode
 $DISTRIBUTE_BY_MODE = uc($DISTRIBUTE_BY_MODE);
 if( $DISTRIBUTE_BY_MODE ne '')
 {
@@ -206,9 +206,28 @@ if( $DISTRIBUTE_BY_MODE ne '')
                 &usage();
         }
 }
-
+# Validate  WHERE_OPTION
 $WHERE_OPTION = uc($WHERE_OPTION);
-print " where option = $WHERE_OPTION\n";
+my %where_config = ();
+while ($WHERE_OPTION =~ s/([^\[\s]+)\s*\[([^\]]+)\]\s*//) 
+{
+	my $table = $1;
+	my $where = $2;
+	$where =~ s/^\s+//;
+	$where =~ s/\s+$//;
+	$where_config{where}{"\L$table\E"} = $where;
+}
+if ($WHERE_OPTION) 
+{
+	$where_config{global_where} = $WHERE_OPTION;
+}
+
+if(! %where_config)
+{
+	print "FATAL: Please reference the office document for WHERE rule\n";
+    &usage();
+}
+
 # end by jiangmj3
 
 # Validate export type

@@ -7013,10 +7013,9 @@ sub _howto_get_data
 	my ($self, $table, $name, $type, $src_type, $part_name, $with_schema) = @_;
 	
 	#add by jiangmj3 
-	$self->logit("cmd where option=".$self->{where_option}."\n");
+	$self->logit("command where option=".$self->{where_option}."\n");
 	if( $self->{where_option} ne '')
 	{
-		
 		$val = $self->{where_option};
 		while ($val =~ s/([^\[\s]+)\s*\[([^\]]+)\]\s*//) 
 		{
@@ -7024,14 +7023,10 @@ sub _howto_get_data
 			my $where = $2;
 			$where =~ s/^\s+//;
 			$where =~ s/\s+$//;
-			#$AConfig{"WHERE"}{$table} = $where;
-			$self->logit("table=".$table."---"."where=".$where."\n");
 			$self->{where}{"\L$table\E"} = $where;
-			
 		}
 		if ($val) 
 		{
-			#$AConfig{"GLOBAL_WHERE"} = $val;
 			$self->{global_where} = $val;
 		}
 	}
