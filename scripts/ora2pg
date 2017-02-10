@@ -80,6 +80,7 @@ my $COUNT_ROWS = 0;
 
 # add by jiangmj3 for distribute by mode ADB
 my $DISTRIBUTE_BY_MODE = '';
+my $WHERE_OPTION = '';
 # end by jiangmj3
 
 my @SCHEMA_ARRAY  = qw( TABLE PACKAGE VIEW GRANT SEQUENCE TRIGGER FUNCTION PROCEDURE TABLESPACE PARTITION TYPE MVIEW DBLINK SYNONYM DIRECTORY );
@@ -113,9 +114,10 @@ GetOptions (
 	'p|plsql!' => \$PLSQL,
 	'P|parallel=i' =>\$PARALLEL_TABLES,
 	'q|quiet!' => \$QUIET,
-	'r|distribute_by_mode=s' =>\$DISTRIBUTE_BY_MODE,
+	'r|distribute_by_mode=s' => \$DISTRIBUTE_BY_MODE,
         't|type=s' => \$EXPORT_TYPE,
         'T|temp_dir=s' => \$TMP_DIR,
+	'W|where_option=s' => \$WHERE_OPTION,	
 	'v|version!' => \$SHOW_VER,
 	's|source=s' => \$DSN,
 	'u|user=s' => \$DBUSER,
@@ -144,7 +146,7 @@ GetOptions (
 
 # Check command line parameters
 if ($SHOW_VER) {
-	print "Ora2Pg v$VERSION\n";
+	print "Ora2Pg for ADB v$VERSION\n";
 	exit 0;
 }
 if ($HELP) {
@@ -194,7 +196,7 @@ if ($FILE_CONF && ! -e $FILE_CONF) {
 push(@CAPABILITIES, @SCHEMA_ARRAY, @REPORT_ARRAY, @DATA_ARRAY, @EXTERNAL_ARRAY, @TEST_ARRAY);
 
 # add by jiangmj3
-# Validate export type
+# Validate  distribute_by_mode
 $DISTRIBUTE_BY_MODE = uc($DISTRIBUTE_BY_MODE);
 if( $DISTRIBUTE_BY_MODE ne '')
 {
@@ -204,6 +206,29 @@ if( $DISTRIBUTE_BY_MODE ne '')
                 &usage();
         }
 }
+# Validate  WHERE_OPTION
+$WHERE_OPTION = uc($WHERE_OPTION);
+my $var = $WHERE_OPTION;
+my %where_config = ();
+while ($var =~ s/([^\[\s]+)\s*\[([^\]]+)\]\s*//) 
+{
+	my $table = $1;
+	my $where = $2;
+	$where =~ s/^\s+//;
+	$where =~ s/\s+$//;
+	$where_config{where}{"\L$table\E"} = $where;
+}
+if ($var) 
+{
+	$where_config{global_where} = $var;
+}
+
+if(! %where_config)
+{
+	print "FATAL: Please reference the office document for WHERE rule\n";
+    &usage();
+}
+
 # end by jiangmj3
 
 # Validate export type
@@ -255,6 +280,7 @@ my $schema = new Ora2Pg (
 	config => $FILE_CONF || $CONFIG_FILE,
 	type   => $EXPORT_TYPE,
 	distribute_by_mode => $DISTRIBUTE_BY_MODE,
+	where_option => $WHERE_OPTION,
 	debug  => $DEBUG,
 	logfile=> $LOGFILE,
 	output => $OUTFILE,
@@ -307,7 +333,7 @@ unless(opendir(DIR, "$TMP_DIR")) {
 @files = grep { $_ =~ /^tmp_ora2pg.*$/ } readdir(DIR);
 closedir DIR;
 if ($#files >= 0) {
-	print STDERR "\nWARNING: an error occurs during data export. Please check what's happen.\n\n";
+	print STDERR "\nWARNING: an error occurs during data export. Please check what's happen. files = $files[0], TMP_DIR = $TMP_DIR\n\n";
 	exit 2;
 }
 
@@ -345,7 +371,8 @@ Usage: ora2pg [-dhpqv --estimate_cost --dump_as_html] [--option value]
     -p | --plsql      : Enable PLSQL to PLPSQL code conversion.
     -P | --parallel num: Number of parallel tables to extract at the same time.
     -q | --quiet      : disable progress bar.
-		-r | --distribute_by_mode mode: table distribute by replication or ROUNDROBIN
+	-r | --distribute_by_mode mode: table distribute by replication or ROUNDROBIN.
+	-W | --where_option: Allow to set the filter condition.
     -s | --source DSN : Allow to set the Oracle DBI datasource.
     -t | --type export: Used to set the export type. It will override the one
 			given in the configuration file (TYPE).
@@ -743,7 +770,7 @@ import_constraints () {
 }
 
 # Command line options
-while getopts "b:d:e:h:j:l:n:o:p:P:t:r:U:aDfiIsyx?"  opt; do
+while getopts "b:d:e:h:j:l:n:o:p:P:t:r:W:U:aDfiIsyx?"  opt; do
     case "$opt" in
 	a) DATA_ONLY=1;;
 	b) SQL_POST_SCRIPT=$OPTARG;;
@@ -763,6 +790,7 @@ while getopts "b:d:e:h:j:l:n:o:p:P:t:r:U:aDfiIsyx?"  opt; do
         s) SCHEMA_ONLY=1;;
         t) EXPORT_TYPE=$OPTARG;;
 		r) DISTRIBUTE_BY_MODE=$OPTARG;;
+		W) WHERE_OPTION=$OPTARG;;
         U) DB_USER=" -U $OPTARG";;
 	x) IMPORT_INDEXES_AFTER=1;;
         y) AUTORUN=1;;
