@@ -11695,7 +11695,7 @@ sub _dump_to_pg
 		{
 			$part_name = $table . '_' . $part_name;
 		}
-		$self->logit("part_name=$part_name, h_towrite=$h_towrite, e_towrite=$e_towrite, sql_out=$sql_out, table=$table\n");
+		#$self->logit("part_name=$part_name, h_towrite=$h_towrite, e_towrite=$e_towrite, sql_out=$sql_out, table=$table\n");
 		
 		my $res = $self->data_dump($h_towrite . $sql_header . $sql_out . $e_towrite, $table, $part_name, $file_no);
 		if ($res == -1)
