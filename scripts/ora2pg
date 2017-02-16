@@ -223,7 +223,7 @@ if ($var)
 	$where_config{global_where} = $var;
 }
 
-if(! %where_config)
+if( ($WHERE_OPTION) && (! %where_config))
 {
 	print "FATAL: Please reference the office document for WHERE rule\n";
     &usage();
