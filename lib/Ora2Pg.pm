@@ -7712,6 +7712,7 @@ sub _unique_key
 	} else {
 		$sql .= " WHERE OWNER NOT IN ('" . join("','", @{$self->{sysusers}}) . "') ";
 	}
+	$sql .= $self->limit_to_objects('TABLE', 'TABLE_NAME');
 	$sql .=  " ORDER BY POSITION";
 	my $sth = $self->{dbh}->prepare($sql) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 	$sth->execute or $self->logit("FATAL: " . $sth->errstr . "\n", 0, 1);
@@ -7728,6 +7729,7 @@ sub _unique_key
 	} else {
 		$condition .= "AND OWNER NOT IN ('" . join("','", @{$self->{sysusers}}) . "') ";
 	}
+	$condition .= $self->limit_to_objects('UKEY|TABLE', 'CONSTRAINT_NAME|TABLE_NAME');
 	$condition .= $self->limit_to_objects('UKEY', 'CONSTRAINT_NAME');
 
 	if ($self->{db_version} !~ /Release 8/) {
@@ -7795,6 +7797,7 @@ sub _check_constraint
 	} else {
 		$condition .= "AND OWNER NOT IN ('" . join("','", @{$self->{sysusers}}) . "') ";
 	}
+	$condition .= $self->limit_to_objects('CKEY|TABLE', 'CONSTRAINT_NAME|TABLE_NAME');
 	$condition .= $self->limit_to_objects('CKEY', 'CONSTRAINT_NAME');
 
 	my $sth = $self->{dbh}->prepare(<<END) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
