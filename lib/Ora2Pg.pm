@@ -830,6 +830,10 @@ sub _init
 	$self->{fts_index_only}  = 0;
 	$self->{fts_config}      = 'pg_catalog.english';
 	
+	# init adbload is 0 . add for adbload by danghb 2017/02/24 10:47:17
+	$self->{adbload}  = 0;
+	#end add
+	
 	# Initialyze following configuration file
 	foreach my $k (sort keys %AConfig) {
 		if (lc($k) eq 'allow') {
@@ -1207,7 +1211,18 @@ sub _init
 	if ($self->{parallel_tables} > 1) {
 		$self->{file_per_table} = 1;
 	}
-
+	
+	# add for adbload by danghb 2017/02/24 10:50:07
+	# if adbload is 1 ,force split_file and file_per_table to 1,output is null
+	if ($self->{adbload} == 1) {
+		$self->{split_file} = 1;
+		$self->{file_per_table} = 1;
+		$self->{output} = '';
+		$self->{disable_sequence} = 1;
+		$self->{stop_on_error} = 0;
+	}
+	# end add 
+	
 	if ($self->{debug}) {
 		$self->logit("Ora2Pg for ADB version: $VERSION\n");
 	}
@@ -2855,6 +2870,11 @@ sub _export_table_data
 	{
 		$self->data_dump($sql_header, $table) if (!$self->{pg_dsn} && $self->{file_per_table});
 	}
+	# 如果指定了adbload，则sql header 为空。 add for adbload by danghb 2017/02/24 05:33:09
+	if ($self->{adbload})
+  {
+  	$sql_header = '';
+  	}
 	
 
 	my $total_record = 0;
@@ -4842,7 +4862,8 @@ LANGUAGE plpgsql ;
 			# Write header to file
 			$self->dump($first_header);
 
-			if ($self->{file_per_table}) {
+      # 如果指定了 adbload 参数，就不写load file  add for adbload by danghb 2017/02/24 05:17:42
+			if ($self->{file_per_table}  && !$self->{adbload}) {
 				# Write file loader
 				$self->dump($load_file);
 			}
@@ -6021,6 +6042,10 @@ sub _dump_table
 			$s_out .= ")";
 			$sprep = $s_out;
 		}
+	}
+	if ($self->{adbload})
+	{
+		$s_out = '';
 	}
 
 	# Extract all data from the current table
@@ -9777,13 +9802,29 @@ sub data_dump
 
 	#add end
 	my $dirprefix = '';
+	# add for adbload by danghb 2017/02/24 04:31:53
+	my $temp_prefix = 'exporting_';
+	my $temp_suffix = '.tmp';
+	# end add
 	$dirprefix = "$self->{output_dir}/" if ($self->{output_dir});
 	my $filename = $self->{output};
 	my $rname = $pname || $tname;
 	if ($self->{file_per_table}) 
 	{
-		$filename = "${rname}_$self->{output}";
-		$filename = "tmp_$filename";
+		#$filename = "${rname}_$self->{output}";
+		# 判断$self->{output} 是否为空，防止出现  T_ADBLOAD__1. 这种情况
+		if ($self->{output})
+		{
+			$filename = "${rname}_$self->{output}";
+		}
+		else
+		{
+			$filename = "${rname}.sql";
+			}
+		# $filename = "tmp_$filename";
+		# 修改临时导出文件名称,   add for adbload by danghb 2017/02/24 03:35:43
+		$filename = "$temp_prefix$filename$temp_suffix";
+		# end add
 	}
 	# Set file temporary until the table export is done
 	if ( ! $self->{split_file} )
@@ -9826,8 +9867,13 @@ sub data_dump
 			{
 				#打开文件
 				my @attrs = split(/\./, $filename);
-				$filename = $attrs[0]."_".$fileno.".".$attrs[1];
-				my $relfilename = substr($filename, 4);
+				#$filename = $attrs[0]."_".$fileno.".".$attrs[1];
+				$filename = $attrs[0]."_".$fileno;
+				for ( my $i = 1 ; $i < @attrs ; ++$i ) {
+         $filename = $filename.".".$attrs[$i];
+        }
+				#my $relfilename = substr($filename, 10,-4);
+				my $relfilename = substr($filename, length($temp_prefix),-length($temp_suffix));
 				$self->logit("Dumping data from $rname to file: $dirprefix$filename\n", 1);
 				if ( -e "$dirprefix$relfilename" ) 
 				{
@@ -9870,8 +9916,13 @@ sub data_dump
 			{
 				#打开文件
 				my @attrs = split(/\./, $filename);
-				$filename = $attrs[0]."_".$fileno.".".$attrs[1];
-				my $relfilename = substr($filename, 4);
+				#$filename = $attrs[0]."_".$fileno.".".$attrs[1];
+				$filename = $attrs[0]."_".$fileno;
+				for ( my $i = 1 ; $i < @attrs ; ++$i ) {
+         $filename = $filename.".".$attrs[$i];
+        }
+				#my $relfilename = substr($filename, 10,-4);
+				my $relfilename = substr($filename, length($temp_prefix),-length($temp_suffix));
 				$self->logit("Dumping data from $rname to file: $dirprefix$filename\n", 1);
 				if ( -e "$dirprefix$relfilename" ) 
 				{
@@ -11143,6 +11194,7 @@ sub _extract_data
 
 	# Extract data now by chunk of DATA_LIMIT and send them to a dedicated job
 	$self->logit("Fetching all data from $rname tuples...\n", 1);
+	$self->logit("The query sql is : $query...\n", 1);
 
 	my $start_time   = time();
 	my $total_record = 0;
@@ -11616,8 +11668,15 @@ sub _dump_to_pg
 		else 
 		{
 			# then add data to the output
+			# 添加数据到sql_out中，每条数据一行，data_limit 条数据结束后，添加 \.
 			map { $sql_out .= join("\t", @$_) . "\n"; } @$rows;
-			$sql_out .= "\\.\n";
+			# $sql_out .= "\\.\n";
+			# 如果没有指定adbload参数，则在copy命令的尾部添加 \.  add for adbload by danghb 2017/02/24 03:16:57
+			if (!$self->{adbload})
+			{
+				$sql_out .= "\\.\n";
+			}
+			# end add
 		}
 	}
 	elsif (!$sprep) 
