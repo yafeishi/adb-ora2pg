@@ -1217,11 +1217,25 @@ sub _init
 	if ($self->{adbload} == 1) {
 		$self->{split_file} = 1;
 		$self->{file_per_table} = 1;
-		$self->{output} = '';
+		$self->{output} = '.sql';
 		$self->{disable_sequence} = 1;
 		$self->{stop_on_error} = 0;
 	}
 	# end add 
+	if (!$self->{output}  && $self->{adbload} != 1) {
+		 if ($self->{file_per_table} == 1){
+		 	  $self->{output} = '.sql' ;
+		 	}
+		 	else {
+		 		$self->{output} = 'output.sql' ;
+		 		}
+		}elsif ($self->{output}  && $self->{adbload} != 1){
+				if ($self->{file_per_table} == 1 && (grep(/^$self->{type}$/, 'COPY','INSERT'))){
+		 	  $self->{output} = '_'.$self->{output} if (substr($self->{output},0,1) ne  '_');
+		 	}
+		}
+	$self->{temp_prefix} = 'exporting_';
+	$self->{temp_suffix} = '.tmp';
 	
 	if ($self->{debug}) {
 		$self->logit("Ora2Pg for ADB version: $VERSION\n");
@@ -3000,11 +3014,17 @@ sub _export_table_data
  	if (($self->{parallel_tables} > 1) && $self->{pg_dsn}) {
  		$local_dbh->disconnect();
  	}
-
+ 	
+	if ($self->{file_per_table}) 
+	{
+		$filename = "${table}$self->{output}";
+		$filename = "$self->{temp_prefix}$filename$self->{temp_suffix}";
+	}	
+	my $relfilename = substr($filename, length($self->{temp_prefix}),-length($self->{temp_suffix}));
 	# Rename temporary output file
-	if (-e "${dirprefix}tmp_${table}_$self->{output}") {
-		$self->logit("Renaming temporary file ${dirprefix}tmp_${table}_$self->{output} into ${dirprefix}${table}_$self->{output}\n", 1);
-		rename("${dirprefix}tmp_${table}_$self->{output}", "${dirprefix}${table}_$self->{output}");
+	if (-e "${dirprefix}$filename") {
+		$self->logit("Renaming temporary file ${dirprefix}$filename into ${dirprefix}$relfilename\n", 1);
+		rename("${dirprefix}$filename", "${dirprefix}$relfilename");
 	}
 
 	return $total_record;
@@ -4824,7 +4844,7 @@ LANGUAGE plpgsql ;
 
 			#### Add external data file loading if file_per_table is enable
 			if ($self->{file_per_table} && !$self->{pg_dsn}) {
-				my $file_name = "$dirprefix${table}_$self->{output}";
+				my $file_name = "$dirprefix${table}$self->{output}";
 				$file_name =~ s/\.(gz|bz2)$//;
 				$load_file .=  "\\i $file_name\n";
 			}
@@ -5721,12 +5741,22 @@ CREATE TRIGGER ${table}_trigger_insert
 				}
 				$sql_output .= ",\n";
 			}
+			
+			my $pkey = $self->_get_primary_keys($table, $self->{tables}{$table}{unique_key});	
+			my $ukey = $self->_get_unique_keys($table, $self->{tables}{$table}{unique_key});	
+
 			if ($self->{pkey_in_create}) {
-				$sql_output .= $self->_get_primary_keys($table, $self->{tables}{$table}{unique_key});
+			  if ($pkey) {
+			   $sql_output .= $pkey;
+				 $sql_output .= ",\n";
+			  }
 			}
-			#add by jiangmj3
+			#add by jiangmj3  
 			if ($self->{ukey_in_create}) {
-				$sql_output .= $self->_get_unique_keys($table, $self->{tables}{$table}{unique_key});
+			  if ($ukey) {
+			   $sql_output .= $ukey;
+				 $sql_output .= ",\n";
+			  }
 			}
 			#add end
 			
@@ -6549,7 +6579,7 @@ sub _get_unique_keys
 				#{
 				#	$out .= " USING INDEX TABLESPACE $self->{tables}{$table}{idx_tbsp}{$index_name}";
 				#}
-				$out .= ",\n";
+				$out .= ",";
 			}
 		}
 	}
@@ -6604,7 +6634,7 @@ sub _get_primary_keys
 				if ($self->{use_tablespace} && $self->{tables}{$table}{idx_tbsp}{$index_name} && !grep(/^$self->{tables}{$table}{idx_tbsp}{$index_name}$/i, @{$self->{default_tablespaces}})) {
 					$out .= " USING INDEX TABLESPACE $self->{tables}{$table}{idx_tbsp}{$index_name}";
 				}
-				$out .= ",\n";
+				$out .= ",";
 			}
 		}
 	}
@@ -9802,34 +9832,18 @@ sub data_dump
 
 	#add end
 	my $dirprefix = '';
-	# add for adbload by danghb 2017/02/24 04:31:53
-	my $temp_prefix = 'exporting_';
-	my $temp_suffix = '.tmp';
-	# end add
 	$dirprefix = "$self->{output_dir}/" if ($self->{output_dir});
 	my $filename = $self->{output};
 	my $rname = $pname || $tname;
 	if ($self->{file_per_table}) 
 	{
-		#$filename = "${rname}_$self->{output}";
-		# 判断$self->{output} 是否为空，防止出现  T_ADBLOAD__1. 这种情况
-		if ($self->{output})
-		{
-			$filename = "${rname}_$self->{output}";
-		}
-		else
-		{
-			$filename = "${rname}.sql";
-			}
-		# $filename = "tmp_$filename";
-		# 修改临时导出文件名称,   add for adbload by danghb 2017/02/24 03:35:43
-		$filename = "$temp_prefix$filename$temp_suffix";
-		# end add
+		$filename = "${rname}$self->{output}";
+		$filename = "$self->{temp_prefix}$filename$self->{temp_suffix}";
 	}
 	# Set file temporary until the table export is done
 	if ( ! $self->{split_file} )
 	{
-		$self->logit("Dumping data from $rname to file: $dirprefix${rname}_$self->{output}\n", 1);
+		$self->logit("Dumping data from $rname to file: $dirprefix$filename\n", 1);
 	}
 
 	if ( ($self->{jobs} > 1) || ($self->{oracle_copies} > 1) ) 
@@ -9873,7 +9887,7 @@ sub data_dump
          $filename = $filename.".".$attrs[$i];
         }
 				#my $relfilename = substr($filename, 10,-4);
-				my $relfilename = substr($filename, length($temp_prefix),-length($temp_suffix));
+				my $relfilename = substr($filename, length($self->{temp_prefix}),-length($self->{temp_suffix}));
 				$self->logit("Dumping data from $rname to file: $dirprefix$filename\n", 1);
 				if ( -e "$dirprefix$relfilename" ) 
 				{
@@ -9910,7 +9924,7 @@ sub data_dump
 				else 
 				{
 					$self->{cfhout}->print($data);
-				}
+				}			
 			}
 			else
 			{
@@ -9922,7 +9936,7 @@ sub data_dump
          $filename = $filename.".".$attrs[$i];
         }
 				#my $relfilename = substr($filename, 10,-4);
-				my $relfilename = substr($filename, length($temp_prefix),-length($temp_suffix));
+				my $relfilename = substr($filename, length($self->{temp_prefix}),-length($self->{temp_suffix}));
 				$self->logit("Dumping data from $rname to file: $dirprefix$filename\n", 1);
 				if ( -e "$dirprefix$relfilename" ) 
 				{
