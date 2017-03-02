@@ -3,7 +3,7 @@
 # Project  : Oracle to Postgresql converter
 # Name     : ora2pg_scanner
 # Author   : Gilles Darold, gilles _AT_ darold _DOT_ net
-# Copyright: Copyright (c) 2000-2016 : Gilles Darold - All rights reserved -
+# Copyright: Copyright (c) 2000-2017 : Gilles Darold - All rights reserved -
 # Function : Script used to scan a list of DSN and generate reports
 # Usage    : ora2pg_scanner -l dsn_csv_file -o outdir
 #------------------------------------------------------------------------------
@@ -12,21 +12,21 @@
 #        it under the terms of the GNU General Public License as published by
 #        the Free Software Foundation, either version 3 of the License, or
 #        any later version.
-#
+# 
 #        This program is distributed in the hope that it will be useful,
 #        but WITHOUT ANY WARRANTY; without even the implied warranty of
 #        MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 #        GNU General Public License for more details.
-#
+# 
 #        You should have received a copy of the GNU General Public License
 #        along with this program. If not, see < http://www.gnu.org/licenses/ >.
-#
+# 
 #------------------------------------------------------------------------------
 use strict;
 
 use Getopt::Long qw(:config no_ignore_case bundling);
 
-my $VERSION = '17.5';
+my $VERSION = '18.1';
 
 my @DB_DNS = ();
 my $OUTDIR = '';
@@ -143,3 +143,4 @@ Usage: ora2pg_scanner -l CSVFILE [-o OUTDIR]
 };
 	exit 1;
 }
+
