@@ -5938,7 +5938,7 @@ CREATE TRIGGER ${table}_trigger_insert
       my $pkey = $self->_get_primary_keys($table, $self->{tables}{$table}{unique_key});	
       my $ukey = $self->_get_unique_keys($table, $self->{tables}{$table}{unique_key});	
        
-      f ($self->{pkey_in_create}) {
+      if ($self->{pkey_in_create}) {
        		  if ($pkey) {
        		   $sql_output .= $pkey;
        			 $sql_output .= ",\n";
@@ -15778,7 +15778,7 @@ sub escape_copy
 	$col =~ s/(\0|\\|\r|\n|\t)/$replacements->{$1}/egs;
 	if (!$self->{noescape}) {
 		$col =~ s/\f/\\f/gs;
-		$col =~ s/([\14\16-\37])/sprintf("\\%03o", ord($1))/egs;
+		$col =~ s/([\1-\10\13-\14\16-\37])/sprintf("\\%03o", ord($1))/egs;
 #		$col =~ s/([\1-\10])/sprintf("\\%03o", ord($1))/egs;
 #		$col =~ s/([\13-\14])/sprintf("\\%03o", ord($1))/egs;
 #		$col =~ s/([\16-\37])/sprintf("\\%03o", ord($1))/egs;
