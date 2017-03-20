@@ -849,6 +849,8 @@ sub _init
 	$self->{text_values} = ();
 	$self->{text_values_pos} = 0;
 
+    # init split_limit is 0 . add for split file by danghb 2017/02/24 10:47:17
+	$self->{split_limit}  = 0;
 	# Initialyze following configuration file
 	foreach my $k (sort keys %AConfig) {
 		if (lc($k) eq 'allow') {
@@ -1249,6 +1251,11 @@ sub _init
 		$self->{disable_sequence} = 1;
 		$self->{stop_on_error} = 0;
 	}
+	if ($self->{split_file} == 1 && $self->{adbload} != 1) { 
+		$self->{file_per_table} = 1;  
+		$self->{disable_sequence} = 1;
+		$self->{stop_on_error} = 0;
+	} 
 	# end add 
 	if (!$self->{output}  && $self->{adbload} != 1) {
 		 if ($self->{file_per_table} == 1){
@@ -5074,11 +5081,12 @@ LANGUAGE plpgsql ;
 
 		if (!$self->{pg_dsn}) {
 			# Write header to file
-			$self->dump($first_header);
+			#$self->dump($first_header);
 
-      # 如果指定了 adbload 参数，就不写load file  add for adbload by danghb 2017/02/24 05:17:42
-			if ($self->{file_per_table}  && !$self->{adbload}) {
+      # 如果指定了 adbload或者split_file 参数，就不写load file  add for adbload by danghb 2017/02/24 05:17:42
+			if ($self->{file_per_table}  && !$self->{adbload} && !$self->{split_file}) {
 				# Write file loader
+				$self->dump($first_header);
 				$self->dump($load_file);
 			}
 		}
@@ -10207,7 +10215,7 @@ File is open and locked before writind data, it is closed at end.
 
 sub data_dump
 {
-	my ($self, $data, $tname, $pname, $fileno) = @_;
+	my ($self, $data, $tname, $pname, $fileno,$is_rename) = @_;
 	#add by jiangmj3
 	#当使用ora2pg -c ora2pg_MON.conf  -o ~/aaa.sql -d 输出路径中带有绝对路径时候会出错
 	#----------dirprefix=, filename=/root/aaa.sql----------
@@ -10274,13 +10282,9 @@ sub data_dump
 				#my $relfilename = substr($filename, 10,-4);
 				my $relfilename = substr($filename, length($self->{temp_prefix}),-length($self->{temp_suffix}));
 				$self->logit("Dumping data from $rname to file: $dirprefix$filename\n", 1);
-				if ( -e "$dirprefix$relfilename" ) 
-				{
-					$self->logit("WARNING: Skipping dumping data to file $dirprefix$relfilename, file already exists.\n", 0);
-					return -1;
-				}
+
+				$fh = $self->append_export_file($filename);
 				
-				$fh = $self->open_export_file($filename);
 				
 				#写入头信息 set client begin；
 				$fh->print($data);
@@ -10289,10 +10293,13 @@ sub data_dump
 				$self->close_export_file($fh);
 				
 				# Rename temporary output file
+				if ($is_rename)
+				{
 				if (-e "$dirprefix$filename") 
 				{
 					$self->logit("Renaming temporary file $dirprefix$filename into $dirprefix$relfilename\n", 1);
 					rename("$dirprefix$filename", "$dirprefix$relfilename");
+				}
 				}
 			}
 			
@@ -10309,7 +10316,7 @@ sub data_dump
 				else 
 				{
 					$self->{cfhout}->print($data);
-				}			
+				}
 			}
 			else
 			{
@@ -10323,13 +10330,8 @@ sub data_dump
 				#my $relfilename = substr($filename, 10,-4);
 				my $relfilename = substr($filename, length($self->{temp_prefix}),-length($self->{temp_suffix}));
 				$self->logit("Dumping data from $rname to file: $dirprefix$filename\n", 1);
-				if ( -e "$dirprefix$relfilename" ) 
-				{
-					$self->logit("WARNING: Skipping dumping data to file $dirprefix$relfilename, file already exists.\n", 0);
-					return -1;
-				}
 				
-				$fh = $self->open_export_file($filename);
+        $fh = $self->append_export_file($filename);
 				
 				#写入头信息 set client begin；
 				$fh->print($data);
@@ -10338,10 +10340,13 @@ sub data_dump
 				$self->close_export_file($fh);
 				
 				# Rename temporary output file
+				if ($is_rename)
+				{
 				if (-e "$dirprefix$filename") 
 				{
 					$self->logit("Renaming temporary file $dirprefix$filename into $dirprefix$relfilename\n", 1);
 					rename("$dirprefix$filename", "$dirprefix$relfilename");
+				}
 				}
 				
 			}
@@ -11703,10 +11708,12 @@ sub _extract_data
 		if (!$has_blob || $self->{no_lob_locator}) 
 		{
 			#处理所有的记录
-			my $file_no = 0;
+			my $file_no = 1;
+			my $is_rename = 0;
+			my $current_rows = 0;
 			while ( my $rows = $sth->fetchall_arrayref(undef,$data_limit)) 
 			{
-				$file_no++;
+
 				if ( ($self->{parallel_tables} > 1) || (($self->{oracle_copies} > 1) && $self->{defined_pk}{"\L$table\E"}) ) 
 				{
 					if ($dbh->errstr) {
@@ -11722,6 +11729,12 @@ sub _extract_data
 
 				$total_record += @$rows;
 				$self->{current_total_row} += @$rows;
+				$current_rows  += @$rows;
+        if ($current_rows >= $self->{split_limit} ||  $self->{data_limit} > @$rows) 
+        {
+        	$is_rename = 1;
+        }
+				$self->logit("current_rows: $current_rows ,is_rename:$is_rename,file_no:$file_no,split_limit:$self->{split_limit}\n");
 
 				if ( ($self->{jobs} > 1) || ($self->{oracle_copies} > 1) ) 
 				{
@@ -11738,7 +11751,7 @@ sub _extract_data
 					spawn sub 
 					{
 						my $file_no = 0;
-						$self->_dump_to_pg($proc, $rows, $table, $sql_header, $cmd_head, $cmd_foot, $s_out, $tt, $sprep, $stt, $start_time, $part_name, $total_record, $file_no, %user_type);
+						$self->_dump_to_pg($proc, $rows, $table, $sql_header, $cmd_head, $cmd_foot, $s_out, $tt, $sprep, $stt, $start_time, $part_name, $total_record, $file_no, $is_rename, %user_type);
 					};
 					$self->{child_count}++;
 				} 
@@ -11750,13 +11763,19 @@ sub _extract_data
 					}
 					if ( $total_record != 0)
 					{
-						my $res = $self->_dump_to_pg($proc, $rows, $table, $sql_header, $cmd_head, $cmd_foot, $s_out, $tt, $sprep, $stt, $start_time, $part_name, $total_record, $file_no,%user_type);
+						my $res = $self->_dump_to_pg($proc, $rows, $table, $sql_header, $cmd_head, $cmd_foot, $s_out, $tt, $sprep, $stt, $start_time, $part_name, $total_record, $file_no, $is_rename, %user_type);
 						if($res == -1)
 						{
 							$self->logit("WARNING: an error occurs during data export. Please check what's happen.\n");
 							last;
 						}
 					}	
+				}
+				$is_rename = 0;
+				if ($current_rows >= $self->{split_limit} )
+				{
+					$file_no++;
+					$current_rows = 0;
 				}
 			}
 
@@ -12021,7 +12040,7 @@ sub log_error_insert
 
 sub _dump_to_pg
 {
-	my ($self, $procnum, $rows, $table, $sql_header,$cmd_head, $cmd_foot, $s_out, $tt, $sprep, $stt, $ora_start_time, $part_name, $glob_total_record, $file_no,%user_type) = @_;
+	my ($self, $procnum, $rows, $table, $sql_header,$cmd_head, $cmd_foot, $s_out, $tt, $sprep, $stt, $ora_start_time, $part_name, $glob_total_record, $file_no,$is_rename,%user_type) = @_;
 
 	my @tempfiles = ();
 
@@ -12227,7 +12246,7 @@ sub _dump_to_pg
 		}
 		#$self->logit("part_name=$part_name, h_towrite=$h_towrite, e_towrite=$e_towrite, sql_out=$sql_out, table=$table\n");
 		
-		my $res = $self->data_dump($h_towrite . $sql_header . $sql_out . $e_towrite, $table, $part_name, $file_no);
+		my $res = $self->data_dump($h_towrite . $sql_header . $sql_out . $e_towrite, $table, $part_name, $file_no,$is_rename);
 		if ($res == -1)
 		{
 			$dbhdest->disconnect() if ($dbhdest);
