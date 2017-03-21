@@ -10239,16 +10239,50 @@ sub data_dump
 		$self->logit("Dumping data from $rname to file: $dirprefix$filename\n", 1);
 	}
 
-	if ( ($self->{jobs} > 1) || ($self->{oracle_copies} > 1) ) 
+	if ( ($self->{jobs} > 1) || (($self->{oracle_copies} > 1) && $self->{defined_pk}{"\L$table\E"}) ) 
 	{
 		$self->{fhout}->close() if (defined $self->{fhout} && !$self->{file_per_table} && !$self->{pg_dsn});
-		
-		my $fh = $self->append_export_file($filename);
+	 if( ! $self->{split_file} )
+	 {
+	 	my $fh = $self->append_export_file($filename);
 		flock($fh, 2) || die "FATAL: can't lock file $dirprefix$filename\n";
 		
 		$fh->print($data);
 		$self->close_export_file($fh);
 		$self->logit("Written " . length($data) . " bytes to $dirprefix$filename\n", 1);
+	 	}
+	 	else
+	 	{
+	 		  #打开文件
+				my @attrs = split(/\./, $filename);
+				#$filename = $attrs[0]."_".$fileno.".".$attrs[1];
+				$filename = $attrs[0]."_".$fileno;
+				for ( my $i = 1 ; $i < @attrs ; ++$i ) {
+         $filename = $filename.".".$attrs[$i];
+        }
+				#my $relfilename = substr($filename, 10,-4);
+				my $relfilename = substr($filename, length($self->{temp_prefix}),-length($self->{temp_suffix}));
+				$self->logit("Dumping data from $rname to file: $dirprefix$filename\n", 1);
+				
+        $fh = $self->append_export_file($filename);
+				
+				#写入头信息 set client begin；
+				$fh->print($data);
+				
+				#关闭文件
+				$self->close_export_file($fh);
+				
+				# Rename temporary output file
+				if ($is_rename)
+				{
+				 if (-e "$dirprefix$filename") 
+				 {
+				 	$self->logit("Renaming temporary file $dirprefix$filename into $dirprefix$relfilename\n", 1);
+				 	rename("$dirprefix$filename", "$dirprefix$relfilename");
+				 }
+				}
+	 		}
+		
 		# Reopen default output file
 		$self->create_export_file() if (defined $self->{fhout} && !$self->{file_per_table} && !$self->{pg_dsn});
 	} 
@@ -11736,7 +11770,7 @@ sub _extract_data
         }
 				$self->logit("current_rows: $current_rows ,is_rename:$is_rename,file_no:$file_no,split_limit:$self->{split_limit}\n");
 
-				if ( ($self->{jobs} > 1) || ($self->{oracle_copies} > 1) ) 
+				if ( ($self->{jobs} > 1) || (($self->{oracle_copies} > 1) && $self->{defined_pk}{"\L$table\E"}) ) 
 				{
 					while ($self->{child_count} >= $self->{jobs}) 
 					{
@@ -11750,7 +11784,11 @@ sub _extract_data
 					}
 					spawn sub 
 					{
-						my $file_no = 0;
+						my $file_no = $proc;
+						if ($self->{data_limit} > @$rows) 
+            {
+            	my $is_rename = 1;
+            }
 						$self->_dump_to_pg($proc, $rows, $table, $sql_header, $cmd_head, $cmd_foot, $s_out, $tt, $sprep, $stt, $start_time, $part_name, $total_record, $file_no, $is_rename, %user_type);
 					};
 					$self->{child_count}++;
@@ -15719,8 +15757,7 @@ sub normalize_query
 	$orig_query =~ s/'[^']*'/''/g;
 	$orig_query =~ s/''('')+/''/g;
 
-	# Remove NULL parameters
-	$orig_query =~ s/=\s*NULL/=''/g;
+	# Removuery =~ s/=\s*NULL/=''/g;
 
 	# Remove numbers
 	$orig_query =~ s/([^a-z_\$-])-?([0-9]+)/${1}0/g;
