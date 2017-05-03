@@ -11764,11 +11764,6 @@ sub _extract_data
 				$total_record += @$rows;
 				$self->{current_total_row} += @$rows;
 				$current_rows  += @$rows;
-        if ($current_rows >= $self->{split_limit} ||  $self->{data_limit} > @$rows) 
-        {
-        	$is_rename = 1;
-        }
-				$self->logit("current_rows: $current_rows ,is_rename:$is_rename,file_no:$file_no,split_limit:$self->{split_limit}\n");
 
 				if ( ($self->{jobs} > 1) || (($self->{oracle_copies} > 1) && $self->{defined_pk}{"\L$table\E"}) ) 
 				{
@@ -11784,17 +11779,25 @@ sub _extract_data
 					}
 					spawn sub 
 					{
-						my $file_no = $proc;
+						my $file_no_proc = $proc;
+						my $is_rename_parallel = 0;
 						if ($self->{data_limit} > @$rows) 
             {
-            	my $is_rename = 1;
+               $is_rename_parallel = 1;
             }
-						$self->_dump_to_pg($proc, $rows, $table, $sql_header, $cmd_head, $cmd_foot, $s_out, $tt, $sprep, $stt, $start_time, $part_name, $total_record, $file_no, $is_rename, %user_type);
+            $self->logit("process:$proc,current_rows: $current_rows ,is_rename:$is_rename_parallel,file_no:$file_no_proc,split_limit:$self->{split_limit}\n");
+						$self->_dump_to_pg($proc, $rows, $table, $sql_header, $cmd_head, $cmd_foot, $s_out, $tt, $sprep, $stt, $start_time, $part_name, $total_record, $file_no_proc, $is_rename_parallel, %user_type);
 					};
 					$self->{child_count}++;
 				} 
 				else 
 				{
+					if ($current_rows >= $self->{split_limit} ||  $self->{data_limit} > @$rows) 
+          {
+          	$is_rename = 1;
+          }
+				  $self->logit("current_rows: $current_rows ,is_rename:$is_rename,file_no:$file_no,split_limit:$self->{split_limit}\n");
+					
 					if ( $self->{debug}) 
 					{
 						$self->logit("begin to call function _dump_to_pg\n");
@@ -11808,13 +11811,14 @@ sub _extract_data
 							last;
 						}
 					}	
-				}
-				$is_rename = 0;
-				if ($current_rows >= $self->{split_limit} )
-				{
-					$file_no++;
-					$current_rows = 0;
-				}
+					$is_rename = 0;
+				  if ($current_rows >= $self->{split_limit} )
+				  {
+				  	$file_no++;
+				  	$current_rows = 0;
+				  }
+				 }
+				
 			}
 
 		} 
@@ -12030,7 +12034,7 @@ sub _extract_data
 			$pipe->print("TABLE EXPORT ENDED: $t_name, end: $t_time, rows $total_record\n");
 		}
 	}
-
+	
 	$dbh->disconnect() if ($dbh);
 
 	# Only useful for single process
