@@ -40,7 +40,7 @@ use vars qw($VERSION);
 
 use strict;
 
-$VERSION = '18.1';
+$VERSION = '18.2';
 
 # SDO_ETYPE
 # Second element of triplet in SDO_ELEM_INFO
@@ -479,12 +479,14 @@ sub createMultiLine
 
 		if ($etype == $SDO_ETYPE{LINESTRING}) {
 			push(@list, $self->createLine($i, $coords));
+		} elsif ($etype == $SDO_ETYPE{COMPOUNDCURVE}) {
+			push(@list, $self->createCompoundLine(1, $coords, -1));
 		} else { # not a LineString - get out of here
 			$cont = 0;
 		}
 	}
 
-	if ($interpretation > 1) {
+	if ($interpretation > 1 || grep(/CIRCULARSTRING/, @list)) {
 		return "MULTICURVE$self->{geometry}{suffix} (" . join(', ', @list) . ')';
 	}
 
@@ -590,9 +592,8 @@ sub createPolygon
 	}
 
 	my $poly = '';
-	if (($interpretation == 2) || ($interpretation == 4)) {
+	if ($interpretation > 1) {
 		if ($self->{geometry}{sdo_elem_info}->[1] == $SDO_ETYPE{COMPOUND_POLYGON_EXTERIOR}) {
-			$rings[0] =~ s/^CIRCULARSTRING$self->{geometry}{suffix} //;
 			$poly = "CURVEPOLYGON$self->{geometry}{suffix} (COMPOUNDCURVE$self->{geometry}{suffix} (" . join(', ', @rings) . '))';
 		} else {
 			$poly = "CURVEPOLYGON$self->{geometry}{suffix} (" . join(', ', @rings) . ')';
@@ -659,7 +660,7 @@ sub createLinearRing
 		}
 		if ($interpretation == 2) {
 			if ( ($etype == $SDO_ETYPE{LINESTRING}) || ($etype == $SDO_ETYPE{POLYGON_EXTERIOR}) || ($etype == $SDO_ETYPE{POLYGON_INTERIOR}) ) {
-				$end++;
+				#$end++;
 			}
 		}
 		if ( ($self->{geometry}{sdo_elem_info}->[1] == $SDO_ETYPE{COMPOUND_POLYGON_INTERIOR}) || ($self->{geometry}{sdo_elem_info}->[1] == $SDO_ETYPE{COMPOUND_POLYGON_EXTERIOR}) ) {
@@ -673,14 +674,16 @@ sub createLinearRing
 	}
 
 	if (($etype == $SDO_ETYPE{POLYGON_EXTERIOR}) && ($interpretation == 2)) {
-		return "CIRCULARSTRING$self->{geometry}{suffix} (" . $ring . ')';
+		$ring = "CIRCULARSTRING$self->{geometry}{suffix} (" . $ring . ')';
 	} elsif (($etype == $SDO_ETYPE{COMPOUND_POLYGON_EXTERIOR}) && ($interpretation == 2)) {
-		return "COMPOUNDCURVE$self->{geometry}{suffix} (" . $ring . ')';
-	} elsif ( $etype == $SDO_ETYPE{LINESTRING}) {
-		return "CIRCULARSTRING$self->{geometry}{suffix} (" . $ring . ')';
+		$ring = "COMPOUNDCURVE$self->{geometry}{suffix} (" . $ring . ')';
+	} elsif ( $etype == $SDO_ETYPE{LINESTRING} && ($interpretation == 2)) {
+		$ring = "CIRCULARSTRING$self->{geometry}{suffix} (" . $ring . ')';
+	} else {
+		$ring = '(' . $ring . ')';
 	}
 
-	return '(' . $ring . ')';
+	return $ring;
 }
 
 # Create CompoundLineString
@@ -784,7 +787,7 @@ sub createPoint
 	my $start = ($sOffset - 1) / $self->{geometry}{dim};
 	my $eOffset = $self->get_start_offset($elemIndex + 1); # -1 for end
 	my $end = ($eOffset != -1) ? (($eOffset - 1) / $self->{geometry}{dim}) : ($#{$coords} + 1);
-	my $point = "POINT$self->{geometry}{suffix} (" . $self->setCoordicates($coords, $start, $end) . ')';
+	my $point = "POINT$self->{geometry}{suffix} (" . $self->setCoordicates($coords, $start+1, $end) . ')';
 
 	return $point;
 }

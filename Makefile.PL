@@ -15,8 +15,10 @@ my $CONFDIR = $ENV{CONFDIR} || '/etc/ora2pg';
 my $RPM_CONFDIR = $CONFDIR;
 my $DOCDIR  = $ENV{DOCDIR} || '/usr/local/share/doc/ora2pg';
 my $DEST_CONF_FILE = 'ora2pg.conf.dist';
+my $DATA_LIMIT_DEFAULT = 10000;
 if ($^O =~ /MSWin32|dos/i) {
 	$DEST_CONF_FILE = 'ora2pg_dist.conf';
+	$DATA_LIMIT_DEFAULT = 2000;
 }
 
 my $PREFIX = $ENV{DESTDIR} || $ENV{PREFIX} || $ENV{INSTALL_BASE} ||  '';
@@ -79,7 +81,7 @@ unless(open(OUTCFG, ">$DEST_CONF_FILE")) {
 ORACLE_HOME	$oracle_home
 
 # Set Oracle database connection (datasource, user, password)
-ORACLE_DSN	dbi:Oracle:host=mydb.mydom.fr;sid=SIDNAME
+ORACLE_DSN	dbi:Oracle:host=mydb.mydom.fr;sid=SIDNAME;port=1521
 ORACLE_USER	system
 ORACLE_PWD	manager
 
@@ -93,7 +95,7 @@ DEBUG		0
 
 # This directive can be used to send an initial command to Oracle, just after
 # the connection. For example to unlock a policy before reading objects.
-ORA_INITIAL_COMMAND
+#ORA_INITIAL_COMMAND
 
 
 #------------------------------------------------------------------------------
@@ -270,11 +272,20 @@ CONTEXT_AS_TRGM		0
 # for FTS indexes. Enable this directive if you just want a function-based
 # index like:
 #    CREATE INDEX ON t_document USING gin(to_tsvector('pg_catalog.english', title));
-FTS_INDEX_ONLY	0
+FTS_INDEX_ONLY	1
 
 # Use this directive to change default text search config: pg_catalog.english
 # used with FTS to_tsvector() function. For example, set it to pg_catalog.french
-FTS_CONFIG	pg_catalog.english
+#FTS_CONFIG	pg_catalog.french
+USE_UNACCENT		0
+USE_LOWER_UNACCENT	0
+DATADIFF	0
+DATADIFF_UPDATE_BY_PKEY	0
+DATADIFF_DEL_SUFFIX _del
+DATADIFF_UPD_SUFFIX _upd
+DATADIFF_INS_SUFFIX _ins
+DATADIFF_WORK_MEM	256 MB
+DATADIFF_TEMP_BUFFERS	512 MB
 
 #------------------------------------------------------------------------------
 # CONSTRAINT SECTION (Control constraints export and import behaviors)
@@ -298,7 +309,7 @@ KEEP_PKEY_NAMES 0
 # Enable this directive if you want to add primary key definitions inside the
 # create table statements. If disabled (the default) primary key definition
 # will be added with an alter table statement. Enable it if you are exporting
-# to GreenPlum PostgreSQL database.
+# to GreenPlum PostgreSQL database and AntDB.
 PKEY_IN_CREATE		1
 
 UKEY_IN_CREATE		1
@@ -434,6 +445,7 @@ ORA_RESERVED_WORDS	audit,comment
 # Enable this directive if you have tables or column names that are a reserved
 # word for PostgreSQL. Ora2Pg will double quote the name of the object. 
 USE_RESERVED_WORDS	0
+DISABLE_UNLOGGED	0
 
 #------------------------------------------------------------------------------
 # OUTPUT SECTION (Control output to file or PostgreSQL database)
@@ -475,6 +487,7 @@ FILE_PER_CONSTRAINT	0
 # migration after the indexes creation to move the indexes.
 FILE_PER_INDEX		0
 
+FILE_PER_FKEYS		0
 # Allow data export to be saved in one file per table/view. The files
 # will be named as tablename_OUTPUT. Where OUTPUT is the value of the
 # corresponding configuration directive. You can use .gz xor .bz2
@@ -526,6 +539,7 @@ STOP_ON_ERROR		1
 # under the same condition but -j or JOBS must also be unset or default to 1.
 COPY_FREEZE		0
 
+CREATE_OR_REPLACE	1
 #------------------------------------------------------------------------------
 # TYPE SECTION (Control type behaviors and redefinitions)
 #------------------------------------------------------------------------------
@@ -578,6 +592,7 @@ ENABLE_MICROSECOND      1
 # to use a fake date.
 #REPLACE_ZERO_DATE	1970-01-01 00:00:00
 
+TO_NUMBER_CONVERSION	numeric
 #------------------------------------------------------------------------------
 # GRANT SECTION (Control priviledge and owner export)
 #------------------------------------------------------------------------------
@@ -593,6 +608,7 @@ GEN_USER_PWD	0
 # the directive value # to that username. 
 FORCE_OWNER	0
 
+FORCE_SECURITY_INVOKER	0
 
 #------------------------------------------------------------------------------
 # DATA SECTION (Control data export behaviors)
@@ -600,7 +616,7 @@ FORCE_OWNER	0
 
 # Extract data by bulk of DATA_LIMIT tuples at once. Default 10000. If you set
 # a high value be sure to have enough memory if you have million of rows.
-DATA_LIMIT	10000
+DATA_LIMIT	$DATA_LIMIT_DEFAULT
 
 
 # When Ora2Pg detect a table with some BLOB it will automatically reduce the
@@ -692,6 +708,7 @@ TRIM_TYPE		BOTH
 # this is only relevant if you have user defined type with a column timestamp.
 INTERNAL_DATE_MAX	49
 
+FUNCTION_CHECK		1
 #------------------------------------------------------------------------------
 # PERFORMANCES SECTION (Control export/import performances)
 #------------------------------------------------------------------------------
@@ -780,6 +797,12 @@ EMPTY_LOB_NULL		0
 # is to use a schema to emulate package.
 PACKAGE_AS_SCHEMA	1
 
+REWRITE_OUTER_JOIN	1
+FUNCTION_STABLE		1
+COMMENT_COMMIT_ROLLBACK	0
+COMMENT_SAVEPOINT	0
+USE_ORAFCE	0
+AUTONOMOUS_TRANSACTION	1
 
 #------------------------------------------------------------------------------
 # ASSESSMENT SECTION (Control migration assessment behaviors)
@@ -840,6 +863,8 @@ PG_SUPPORTS_CHECKOPTION	1
 #?keywords in all generated statements.
 PG_SUPPORTS_IFEXISTS	1
 
+PG_SUPPORTS_LATERAL	1
+PG_SUPPORTS_PARTITION	0
 # Use btree_gin extenstion to create bitmap like index with pg >= 9.4
 # You will need to create the extension by yourself:
 #	create extension btree_gin;
@@ -850,6 +875,17 @@ BITMAP_AS_GIN		1
 # of using a dblink wrapper. With pg >= 9.5 only, default is to use dblink.
 PG_BACKGROUND		0
 
+# in the autonomous transaction wrapper function.
+#DBLINK_CONN	port=5432 dbname=pgdb host=localhost user=pguser password=pgpass
+
+# Some versions of PostgreSQL like Redshift doesn't support substr()
+# and it need to be replaced by a call to substring(). In this case,
+# disable it.
+PG_SUPPORTS_SUBSTR		1
+
+# Disable this directive if you are using PG < 9.5, PL/SQL operator used in
+# named parameter => will be replaced by PostgreSQL proprietary operator :=
+PG_SUPPORTS_NAMED_OPERATOR		1
 #------------------------------------------------------------------------------
 # SPATIAL SECTION (Control spatial geometry export)
 #------------------------------------------------------------------------------
@@ -950,7 +986,7 @@ WriteMakefile(
     'DESTDIR'      => $PREFIX,
     'INSTALLDIRS'  => $ENV{INSTALLDIRS},
     'clean'        => {FILES => "$DEST_CONF_FILE lib/blib/"},
-    'PREREQ_PM'    => { DBI => 0, DBD::Oracle },
+    'PREREQ_PM'    => {DBI => 0},
     'META_MERGE'   => {
 	resources  => {
 		homepage => 'http://ora2pg.darold.net/',

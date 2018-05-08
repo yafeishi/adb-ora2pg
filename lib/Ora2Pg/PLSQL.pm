@@ -24,14 +24,14 @@ package Ora2Pg::PLSQL;
 # 
 #------------------------------------------------------------------------------
 
-use vars qw($VERSION %OBJECT_SCORE $SIZE_SCORE $FCT_TEST_SCORE $QUERY_TEST_SCORE %UNCOVERED_SCORE %UNCOVERED_MYSQL_SCORE @ORA_FUNCTIONS @MYSQL_SPATIAL_FCT @MYSQL_FUNCTIONS);
+use vars qw($VERSION %OBJECT_SCORE $SIZE_SCORE $FCT_TEST_SCORE $QUERY_TEST_SCORE %UNCOVERED_SCORE %UNCOVERED_MYSQL_SCORE @ORA_FUNCTIONS @MYSQL_SPATIAL_FCT @MYSQL_FUNCTIONS %EXCEPTION_MAP);
 use POSIX qw(locale_h);
 
 #set locale to LC_NUMERIC C
 setlocale(LC_NUMERIC,"C");
 
 
-$VERSION = '18.1';
+$VERSION = '18.2';
 
 #----------------------------------------------------
 # Cost scores used when converting PLSQL to PLPGSQL
@@ -57,10 +57,12 @@ $VERSION = '18.1';
 	'TYPE BODY' => 10, # Not directly supported need adaptation
 	'VIEW' => 1, # read/adapt
 	'DATABASE LINK' => 3, # Supported as FDW using oracle_fdw
+	'GLOBAL TEMPORARY TABLE' => 10, # supported, but not permanent in PostgreSQL
 	'DIMENSION' => 0, # Not supported and no equivalent
 	'JOB' => 2, # read/adapt
 	'SYNONYM' => 0.1, # read/adapt
 	'QUERY' => 0.2, # read/adapt
+	'ENCRYPTED COLUMN' => 20, ## adapt using pg_crypto
 );
 
 # Scores following the number of characters: 1000 chars for one unit.
@@ -76,15 +78,16 @@ $QUERY_TEST_SCORE = 0.1;
 	'TRUNC' => 0.1,
 	'IS TABLE OF' => 4,
 	'OUTER JOIN' => 2,
-	'CONNECT BY' => 4,
+	'CONNECT BY' => 2,
 	'BULK COLLECT' => 3,
 	'GOTO' => 2,
 	'FORALL' => 1,
 	'ROWNUM' => 2,
-	'NOTFOUND' => 1,
+	'NOTFOUND' => 0,
 	'ISOPEN' => 1,
 	'ROWCOUNT' => 1,
 	'ROWID' => 2,
+	'UROWID' => 2,
 	'IS RECORD' => 1,
 	'SQLCODE' => 1,
 	'TABLE' => 2,
@@ -96,7 +99,8 @@ $QUERY_TEST_SCORE = 0.1;
 	'EXCEPTION' => 2,
 	'TO_NUMBER' => 0.1,
 	'REGEXP_LIKE' => 0.1,
-	'TG_OP' => 1,
+	'REGEXP_SUBSTR' => 0.1,
+	'TG_OP' => 0,
 	'CURSOR' => 0.2,
 	'PIPE ROW' => 1,
 	'ORA_ROWSCN' => 3,
@@ -117,13 +121,14 @@ $QUERY_TEST_SCORE = 0.1;
 	'PRAGMA' => 3,
 	'MDSYS' => 1,
 	'MERGE INTO' => 3,
-	'COMMIT' => 3,
+	'COMMIT' => 1,
 	'CONTAINS' => 1,
 	'SCORE' => 1,
 	'FUZZY' => 1,
 	'NEAR' => 1,
 	'TO_CHAR' => 0.1,
 	'ANYDATA' => 2,
+	'CONCAT' => 0.1,
 );
 
 @ORA_FUNCTIONS = qw(
@@ -134,7 +139,6 @@ $QUERY_TEST_SCORE = 0.1;
 	VSize
 	Bin_To_Num
 	CharToRowid
-	From_Tz
 	HexToRaw
 	NumToDSInterval
 	NumToYMInterval
@@ -162,12 +166,11 @@ $QUERY_TEST_SCORE = 0.1;
 	Sinh
 	Tanh
 	DbTimeZone
-	From_Tz
 	New_Time
 	SessionTimeZone
 	Tz_Offset
-	SysTimestamp
 	Get_Env
+	From_Tz
 );
 
 @MYSQL_SPATIAL_FCT = (
@@ -281,6 +284,14 @@ $QUERY_TEST_SCORE = 0.1;
 	'@VAR' => 0.1,
 );
 
+%EXCEPTION_MAP = (
+	'INVALID_CURSOR' => 'invalid_cursor_state',
+	'ZERO_DIVIDE' => 'division_by_zero',
+	'STORAGE_ERROR' => 'out_of_memory',
+	'INTEGRITY_ERROR' => 'integrity_constraint_violation',
+	# 'PROGRAM_ERROR' => 'INTERNAL ERROR',
+	# 'ROWTYPE_MISMATCH' => 'DATATYPE MISMATCH'
+);
 
 
 =head1 NAME
@@ -307,50 +318,110 @@ compatible code
 
 sub convert_plsql_code
 {
-        my ($class, $str) = @_;
+        my ($class, $str, %data_type) = @_;
 
 	return if ($str eq '');
 
-	# Replace comment with a placeholder
-	$class->{idxcomment} = 0;
-	my %comments = $class->_remove_comments(\$str);
+	# Replace outer join sign (+) with a placeholder
+	$class->{outerjoin_idx} //= 0;
+	while ( $str =~ s/\(\+\)/\%OUTERJOIN$class->{outerjoin_idx}\%/s ) {
+		$class->{outerjoin_idx}++;
+	}
 
-	# Replace all text constant part to prevent a split on a ; inside a text
-	$class->{text_values} = ();
-	$str = $class->remove_text_constant_part($str);
-
-	# Do some initialization iof variables used in recursive functions
+	# Do some initialization of variables
 	%{$class->{single_fct_call}} = ();
+	$class->{replace_out_params} = '';
 
 	# Rewrite all decode() call before
-	$str = replace_decode($str);
+	$str = replace_decode($str) if (uc($class->{type}) ne 'SHOW_REPORT');
+
+	# Replace array syntax arr(i).x into arr[i].x
+	$str =~ s/\b([a-z0-9_]+)\(([^\(\)]+)\)(\.[a-z0-9_]+)/$1\[$2\]$3/igs;
 
 	# Extract all block from the code by splitting it on the semi-comma
 	# character and replace all necessary function call
 	my @code_parts = split(/;/, $str);
-	map { $_ = $class->restore_text_constant_part($_) } @code_parts;
 	for (my $i = 0; $i <= $#code_parts; $i++) {
 		next if (!$code_parts[$i]);
+
+		# For mysql also replace if() statements in queries or views.
+		if ($class->{is_mysql} && grep(/^$class->{type}$/i, 'VIEW', 'QUERY', 'FUNCTION', 'PROCEDURE')) {
+			$code_parts[$i] = Ora2Pg::MySQL::replace_if($code_parts[$i]);
+		}
+
+		# Remove parenthesis from function parameters when they not belong to a function call
+		my %subparams = ();
+		my $p = 0;
+		while ($code_parts[$i] =~ s/(\(\s*)(\([^\(\)]*\))(\s*,)/$1\%SUBPARAMS$p\%$3/is) {
+			$subparams{$p} = $2;
+			$p++;
+		}
+		while ($code_parts[$i] =~ s/(,\s*)(\([^\(\)]*\))(\s*[\),])/$1\%SUBPARAMS$p\%$3/is) {
+			$subparams{$p} = $2;
+			$p++;
+		}
+
+		# Remove some noisy parenthesis for outer join replacement
+		if ($code_parts[$i] =~ /\%OUTERJOIN\d+\%/) {
+			my %tmp_ph = ();
+			my $idx = 0;
+			while ($code_parts[$i] =~ s/\(([^\(\)]*\%OUTERJOIN\d+\%[^\(\)]*)\)/\%SUBPART$idx\%/s) {
+				$tmp_ph{$idx} = $1;
+				$idx++;
+			}
+			foreach my $k (keys %tmp_ph) {
+				if ($tmp_ph{$k} =~ /^\s*[^\s]+\s*(=|NOT LIKE|LIKE)\s*[^\s]+\s*$/i) {
+					$code_parts[$i] =~ s/\%SUBPART$k\%/$tmp_ph{$k}/s;
+				} else {
+					$code_parts[$i] =~ s/\%SUBPART$k\%/\($tmp_ph{$k}\)/s;
+				}
+			}
+		}
+
 		%{$class->{single_fct_call}} = ();
 		$code_parts[$i] = extract_function_code($class, $code_parts[$i], 0);
 
+		# Things that must ne done when functions are replaced with placeholder
+		$code_parts[$i] = replace_without_function($class, $code_parts[$i]);
+
 		foreach my $k (keys %{$class->{single_fct_call}}) {
 			$class->{single_fct_call}{$k} = replace_oracle_function($class, $class->{single_fct_call}{$k});
+			if ($class->{single_fct_call}{$k} =~ /^CAST\s*\(/i) {
+				if (!$class->{is_mysql}) {
+					$class->{single_fct_call}{$k} = Ora2Pg::PLSQL::replace_sql_type($class->{single_fct_call}{$k}, $class->{pg_numeric_type}, $class->{default_numeric}, $class->{pg_integer_type}, %data_type);
+				} else {
+					$class->{single_fct_call}{$k} = Ora2Pg::MySQL::replace_sql_type($class->{single_fct_call}{$k}, $class->{pg_numeric_type}, $class->{default_numeric}, $class->{pg_integer_type}, %data_type);
+				}
+			}
+			if ($class->{single_fct_call}{$k} =~ /^CAST\s*\(.*\%\%REPLACEFCT(\d+)\%\%/i) {
+				if (!$class->{is_mysql}) {
+					$class->{single_fct_call}{$1} = Ora2Pg::PLSQL::replace_sql_type($class->{single_fct_call}{$1}, $class->{pg_numeric_type}, $class->{default_numeric}, $class->{pg_integer_type}, %data_type);
+				} else {
+					$class->{single_fct_call}{$1} = Ora2Pg::MySQL::replace_sql_type($class->{single_fct_call}{$1}, $class->{pg_numeric_type}, $class->{default_numeric}, $class->{pg_integer_type}, %data_type);
+				}
+			}
 		}
 		while ($code_parts[$i] =~ s/\%\%REPLACEFCT(\d+)\%\%/$class->{single_fct_call}{$1}/) {};
+		$code_parts[$i] =~ s/\%SUBPARAMS(\d+)\%/$subparams{$1}/igs;
 	}
-	push(@code_parts, ' ') if ($str =~ /;\s*$/s);
 	$str = join(';', @code_parts);
-	$str = $class->restore_text_constant_part($str);
-	$class->{text_values} = ();
+
+	if ($class->{replace_out_params}) {
+		if ($str !~ s/\b(DECLARE\s+)/$1$class->{replace_out_params}\n/is) {
+			$str =~ s/\b(BEGIN\s+)/DECLARE\n$class->{replace_out_params}\n$1/is;
+		}
+		$class->{replace_out_params} = '';
+	}
 
 	# Apply code rewrite on other part of the code
-	$str = $class->remove_text_constant_part($str);
-	$str = plsql_to_plpgsql($class, $str);
-	$str = $class->restore_text_constant_part($str);
-	$class->{text_values} = ();
+	$str = plsql_to_plpgsql($class, $str, %data_type);
 
-	$class->_restore_comments(\$str, \%comments);
+	if ($class->{get_diagnostics}) {
+		if ($str !~ s/\b(DECLARE\s+)/$1$class->{get_diagnostics}\n/is) {
+			$str =~ s/\b(BEGIN\s+)/DECLARE\n$class->{get_diagnostics}\n$1/is;
+		}
+		$class->{get_diagnostics} = '';
+	}
 
 	return $str;
 }
@@ -369,14 +440,24 @@ sub extract_function_code
         # Look for a function call that do not have an other function
         # call inside, replace content with a marker and store the
         # replaced string into a hask to rewritten later to convert pl/sql
-        if ($code =~ s/\b([a-zA-Z\.\_]+)\s*\(([^\(\)]*)\)/\%\%REPLACEFCT$idx\%\%/s) {
+        if ($code =~ s/\b([a-zA-Z0-9\.\_]+)\s*\(([^\(\)]*)\)/\%\%REPLACEFCT$idx\%\%/s) {
 		my $fct_name = $1;
 		my $fct_code = $2;
 		my $space = '';
-		$space = ' ' if (grep (/^$fct_name$/i, 'FROM', 'AS', 'VALUES', 'DEFAULT', 'OR', 'AND', 'IN', 'SELECT', 'OVER', 'WHERE', 'THEN', 'IF', 'ELSIF','EXISTS'));
+		$space = ' ' if (grep (/^$fct_name$/i, 'FROM', 'AS', 'VALUES', 'DEFAULT', 'OR', 'AND', 'IN', 'SELECT', 'OVER', 'WHERE', 'THEN', 'IF', 'ELSIF', 'ELSE', 'EXISTS', 'ON'));
 
+		# Move up any outer join inside a function otherwise it will not be detected
+		my $outerjoin = '';
+		if ($fct_code =~ /\%OUTERJOIN(\d+)\%/s) {
+			my $idx_join = $1;
+			# only if the placeholder content is a function not a predicate
+			if ($fct_code !~ /(=|>|<|LIKE|NULL|BETWEEN)/i) {
+				$fct_code =~ s/\%OUTERJOIN$idx_join\%//s;
+				$outerjoin = "\%OUTERJOIN$idx_join\%";
+			}
+		}
                 # recursively replace function
-                $class->{single_fct_call}{$idx} = $fct_name . $space . '(' . $fct_code . ')';
+                $class->{single_fct_call}{$idx} = $fct_name . $space . '(' . $fct_code . ')' . $outerjoin;
 
                 $code = extract_function_code($class, $code, ++$idx);
         }
@@ -393,10 +474,14 @@ sub append_alias_clause
 	for (my $j = 0; $j <= $#q; $j+=2) {
 		if ($q[$j] =~ s/\b(FROM\s+)(.*\%SUBQUERY.*?)(\s*)(WHERE|ORDER\s+BY|GROUP\s+BY|LIMIT|$)/$1\%FROM_CLAUSE\%$3$4/is) {
 			my $from_clause = $2;
-			my @parts = split(/\b(WHERE|ORDER\s+BY|GROUP\s+BY|LIMIT)\b/i, $from_clause);
-			$parts[0] =~ s/(?<!USING|[\s,]ONLY|[\s,]JOIN)\%SUBQUERY(\d+)\%(\s*,)/\%SUBQUERY$1\% alias$1$2/igs;
-			$parts[0] =~ s/(?<!USING|[\s,]ONLY|[\s,]JOIN)\%SUBQUERY(\d+)\%(\s*)$/\%SUBQUERY$1\% alias$1$2/is;
-			$from_clause = join('', @parts);
+			if ($q[$j] !~ /\b(YEAR|MONTH|DAY|HOUR|MINUTE|SECOND|TIMEZONE_HOUR|TIMEZONE_MINUTE|TIMEZONE_ABBR|TIMEZONE_REGION|TIMEZONE_OFFSET)\s+FROM/is) {
+				my @parts = split(/\b(WHERE|ORDER\s+BY|GROUP\s+BY|LIMIT)\b/i, $from_clause);
+				$parts[0] =~ s/(?<!USING|[\s,]ONLY|[\s,]JOIN|..\sON|.\sAND|..\sOR)\%SUBQUERY(\d+)\%(\s*,)/\%SUBQUERY$1\% alias$1$2/igs;
+				$parts[0] =~ s/(?<!USING|[\s,]ONLY|[\s,]JOIN|.\sON\s|\sAND\s|.\sOR\s)\%SUBQUERY(\d+)\%(\s*)$/\%SUBQUERY$1\% alias$1$2/is;
+				# Remove unwanted alias appended with the REGEXP_SUBSTR translation
+				$parts[0] =~ s/(\%SUBQUERY\d+\%\s+AS\s+[^\s]+)\s+alias\d+/$1/g;
+				$from_clause = join('', @parts);
+			}
 			$q[$j] =~ s/\%FROM_CLAUSE\%/$from_clause/s;
 		}
 	}
@@ -405,6 +490,30 @@ sub append_alias_clause
 	return $str;
 }
 
+sub remove_fct_name
+{
+	my $str = shift;
+	if ($str !~ /(END\b\s*)(IF\b|LOOP\b|CASE\b|INTO\b|FROM\b|END\b|ELSE\b|AND\b|OR\b|WHEN\b|AS\b|,|\)|\(|\||[<>=]|NOT LIKE|LIKE|WHERE|GROUP|ORDER)/is) {
+		$str =~ s/(END\b\s*)[\w"\.]+\s*(?:;|$)/$1;/is;
+	}
+	return $str;
+}
+=head2 set_error_code
+
+Transform custom exception code by replacing the leading -20 by 45
+
+=cut
+sub set_error_code
+{
+	my $code = shift;
+	my $orig_code = $code;
+	$code =~ s/-20(\d{3})/'45$1'/;
+	if ($code =~ s/-20(\d{2})/'450$1'/ || $code =~ s/-20(\d{1})/'4500$1'/) {
+		print STDERR "WARNING: exception code has less than 5 digit, proceeding to automatic adjustement.\n";
+		$code .= " /* code was: $orig_code */";
+	}
+	return $code;
+}
 =head2 plsql_to_plpgsql
 
 This function return a PLSQL code translated to PLPGSQL code
@@ -413,7 +522,7 @@ This function return a PLSQL code translated to PLPGSQL code
 
 sub plsql_to_plpgsql
 {
-        my ($class, $str) = @_;
+        my ($class, $str, %data_type) = @_;
 
 	return if ($str eq '');
 
@@ -423,25 +532,43 @@ sub plsql_to_plpgsql
 	my $num_field = '\s*([\d\.]+)\s*';
 	my $date_field = '\s*([^,\)\(]*(?:date|time)[^,\)\(]*)\s*';
 
-	#--------------------------------------------
-	# PL/SQL to PL/PGSQL code conversion
-	# Feel free to add your contribution here.
-	#--------------------------------------------
 	my $conv_current_time = 'clock_timestamp()';
 	if (!grep(/$class->{type}/i, 'FUNCTION', 'PROCEDURE', 'PACKAGE')) {
 		$conv_current_time = 'LOCALTIMESTAMP';
 	}
 	# Replace sysdate +/- N by localtimestamp - 1 day intervel
-	$str =~ s/SYSDATE\s*(\+|\-)\s*(\d+)/$conv_current_time $1 interval '$2 days'/igs;
+	$str =~ s/\bSYSDATE\s*(\+|\-)\s*(\d+)/$conv_current_time $1 interval '$2 days'/igs;
 	# Change SYSDATE to 'now' or current timestamp.
-	$str =~ s/SYSDATE\s*\(\s*\)/$conv_current_time/igs;
-	$str =~ s/SYSDATE/$conv_current_time/igs;
+	$str =~ s/\bSYSDATE\s*\(\s*\)/$conv_current_time/igs;
+	$str =~ s/\bSYSDATE\b/$conv_current_time/igs;
+	# Cast call to to_date with localtimestamp 
+	$str =~ s/(TO_DATE\($conv_current_time)\s*,/$1::text,/igs;
+
+	# Drop temporary doesn't exist in PostgreSQL
+	$str =~ s/DROP\s+TEMPORARY/DROP/gs;
 
 	# Replace SYSTIMESTAMP 
-	$str =~ s/SYSTIMESTAMP/CURRENT_TIMESTAMP/igs;
+	$str =~ s/\bSYSTIMESTAMP\b/CURRENT_TIMESTAMP/igs;
 	# remove FROM DUAL
-	$str =~ s/FROM DUAL//igs;
-	$str =~ s/FROM SYS\.DUAL//igs;
+	$str =~ s/FROM\s+DUAL//igs;
+	$str =~ s/FROM\s+SYS\.DUAL//igs;
+
+	# Remove space between operators
+	$str =~ s/=\s+>/=>/gs;
+	$str =~ s/<\s+=/<=/gs;
+	$str =~ s/>\s+=/>=/gs;
+	$str =~ s/!\s+=/!=/gs;
+	$str =~ s/<\s+>/<>/gs;
+	$str =~ s/:\s+=/:=/gs;
+	$str =~ s/\|\s+\|/\|\|/gs;
+
+	# replace operator for named parameters in function calls
+	if (!$class->{pg_supports_named_operator}) {
+		$str =~ s/([^<])=>/$1:=/gs;
+	}
+
+	# Replace listagg() call
+	$str =~ s/\bLISTAGG\s*\((.*?)\)\s+WITHIN\s+GROUP\s*\((.*?)\)/string_agg($1 $2)/ig;
 
 	# There's no such things in PostgreSQL
 	$str =~ s/PRAGMA RESTRICT_REFERENCES[^;]+;//igs;
@@ -450,15 +577,19 @@ sub plsql_to_plpgsql
 
 	# Converting triggers
 	#       :new. -> NEW.
-	$str =~ s/([^\w]+):new\./$1NEW\./igs;
+	$str =~ s/:new\./NEW\./igs;
 	#       :old. -> OLD.
-	$str =~ s/([^\w]+):old\./$1OLD\./igs;
+	$str =~ s/:old\./OLD\./igs;
+
+	# Change NVL to COALESCE
+	$str =~ s/NVL\s*\(/coalesce(/is;
+	$str =~ s/NVL2\s*\($field,$field,$field\)/coalesce($1,$3)/is;
 
 	# Replace EXEC function into variable, ex: EXEC :a := test(:r,1,2,3);
-	$str =~ s/EXEC\s+:([^\s:]+)\s*:=/SELECT INTO $2/igs;
+	$str =~ s/\bEXEC\s+:([^\s:]+)\s*:=/SELECT INTO $2/igs;
 
 	# Replace simple EXEC function call by SELECT function
-	$str =~ s/EXEC(\s+)/SELECT$1/igs;
+	$str =~ s/\bEXEC(\s+)/SELECT$1/igs;
 
 	# Remove leading : on Oracle variable
 	$str =~ s/([^\w:]+):(\d+)/$1\$$2/igs;
@@ -468,29 +599,34 @@ sub plsql_to_plpgsql
 	$str =~ s/\bINSERTING\b/TG_OP = 'INSERT'/igs;
 	$str =~ s/\bDELETING\b/TG_OP = 'DELETE'/igs;
 	$str =~ s/\bUPDATING\b/TG_OP = 'UPDATE'/igs;
+	# Replace Oracle call to column in trigger event
+	$str =~ s/TG_OP = '([^']+)'\s*\(\s*([^\)]+)\s*\)/TG_OP = '$1' AND NEW.$2 IS DISTINCT FROM OLD.$2/igs;
 
 	# EXECUTE IMMEDIATE => EXECUTE
 	$str =~ s/EXECUTE IMMEDIATE/EXECUTE/igs;
 
 	# SELECT without INTO should be PERFORM. Exclude select of view when prefixed with AS ot IS
 	if ( ($class->{type} ne 'QUERY') && ($class->{type} ne 'VIEW') ) {
-		$str = $class->remove_text_constant_part($str);
 		$str =~ s/(\s+)(?<!AS|IS)(\s+)SELECT((?![^;]+\bINTO\b)[^;]+;)/$1$2PERFORM$3/isg;
 		$str =~ s/\bSELECT\b((?![^;]+\bINTO\b)[^;]+;)/PERFORM$1/isg;
-		$str =~ s/(AS|IS|FOR|UNION ALL|UNION|MINUS|\()(\s*)(ORA2PG_COMMENT\d+\%)?(\s*)PERFORM/$1$2$3$4SELECT/isg;
+		$str =~ s/(AS|IS|FOR|UNION ALL|UNION|MINUS|INTERSECT|\()(\s*)(\%ORA2PG_COMMENT\d+\%)?(\s*)PERFORM/$1$2$3$4SELECT/isg;
 		$str =~ s/(INSERT\s+INTO\s+[^;]+\s+)PERFORM/$1SELECT/isg;
-		$str = $class->restore_text_constant_part($str);
 	}
 
 	# Change nextval on sequence
 	# Oracle's sequence grammar is sequence_name.nextval.
 	# Postgres's sequence grammar is nextval('sequence_name'). 
-	$str =~ s/(\w+)\.nextval/nextval('\L$1\E')/isg;
-	$str =~ s/(\w+)\.currval/currval('\L$1\E')/isg;
+	$str =~ s/\b(\w+)\.(\w+)\.nextval/nextval('\L$2\E')/isg;
+	$str =~ s/\b(\w+)\.(\w+)\.currval/currval('\L$2\E')/isg;
+	$str =~ s/\b(\w+)\.nextval/nextval('\L$1\E')/isg;
+	$str =~ s/\b(\w+)\.currval/currval('\L$1\E')/isg;
 	# Oracle MINUS can be replaced by EXCEPT as is
 	$str =~ s/\bMINUS\b/EXCEPT/igs;
 	# Comment DBMS_OUTPUT.ENABLE calls
 	$str =~ s/(DBMS_OUTPUT.ENABLE[^;]+;)/-- $1/isg;
+
+	# Raise information to the client
+	$str =~ s/DBMS_OUTPUT\.(put_line|put|new_line)\s*\((.*?)\)\s*;/&raise_output($class, $2) . ';'/isge;
 
 	# Procedure are the same as function in PG
 	$str =~ s/\bPROCEDURE\b/FUNCTION/igs;
@@ -505,7 +641,8 @@ sub plsql_to_plpgsql
 	$str =~ s/\bdup_val_on_index\b/unique_violation/igs;
 
 	# Replace raise_application_error by PG standard RAISE EXCEPTION
-	$str =~ s/\braise_application_error\s*\(\s*[^,]+\s*,\s*(.*?)\);/RAISE EXCEPTION '%', $1;/igs;
+	$str =~ s/\braise_application_error\s*\(\s*([^,]+)\s*,\s*([^;]+),\s*(true|false)\s*\)\s*;/"RAISE EXCEPTION '%', $2 USING ERRCODE = " . set_error_code($1) . ";"/iges;
+	$str =~ s/\braise_application_error\s*\(\s*([^,]+)\s*,\s*([^;]+)\)\s*;/"RAISE EXCEPTION '%', $2 USING ERRCODE = " . set_error_code($1) . ";"/iges;
 	$str =~ s/DBMS_STANDARD\.RAISE EXCEPTION/RAISE EXCEPTION/igs;
 
 	# Remove IN information from cursor declaration
@@ -532,50 +669,68 @@ sub plsql_to_plpgsql
 	# Replace CURSOR (param) IS SELECT by CURSOR FOR SELECT
 	$str =~ s/\bCURSOR(\s*\([^\)]+\)\s*)IS(\s*)SELECT/CURSOR$1FOR$2SELECT/isg;
 	# Replace OPEN cursor FOR with dynamic query
-	$str =~ s/(OPEN\s+(?:.*?)\s+FOR)((?:.*?)USING)/$1 EXECUTE$2/isg;
-	$str =~ s/(OPEN\s+(?:.*?)\s+FOR)\s+((?!EXECUTE)(?:.*?)\|\|)/$1 EXECUTE $2/isg;
-	$str =~ s/(OPEN\s+(?:.*?)\s+FOR)\s+([^\s]+\s*;)/$1 EXECUTE $2/isg;
+	$str =~ s/(OPEN\s+(?:[^;]+?)\s+FOR)((?:[^;]+?)USING)/$1 EXECUTE$2/isg;
+	$str =~ s/(OPEN\s+(?:[^;]+?)\s+FOR)\s+((?!EXECUTE)(?:[^;]+?)\|\|)/$1 EXECUTE $2/isg;
+	$str =~ s/(OPEN\s+(?:[^;]+?)\s+FOR)\s+([^\s]+\s*;)/$1 EXECUTE $2/isg;
+	# Remove empty parenthesis after an open cursor
+	$str =~ s/(OPEN\s+[^\(\s;]+)\s*\(\s*\)/$1/isg;
 
 	# Normalize HAVING ... GROUP BY into GROUP BY ... HAVING clause	
-	$str =~ s/\bHAVING\b(.*?)\bGROUP BY\b(.*?)((?=UNION|ORDER BY|LIMIT|INTO |FOR UPDATE|PROCEDURE)|$)/GROUP BY$2 HAVING$1/gis;
+	$str =~ s/\bHAVING\b((?:(?!SELECT|INSERT|UPDATE|DELETE).)*?)\bGROUP BY\b((?:(?!SELECT|INSERT|UPDATE|DELETE|WHERE).)*?)((?=UNION|ORDER BY|LIMIT|INTO |FOR UPDATE|PROCEDURE|\)\s+(?:AS)*[a-z0-9_]+\s+)|$)/GROUP BY$2 HAVING$1/gis;
 
 	# Add STRICT keyword when select...into and an exception with NO_DATA_FOUND/TOO_MANY_ROW is present
-	$str =~ s/\b(SELECT\b[^;]*?INTO)(.*?)(EXCEPTION.*?(?:NO_DATA_FOUND|TOO_MANY_ROW))/$1 STRICT $2 $3/igs;
+	#$str =~ s/\b(SELECT\b[^;]*?INTO)(.*?)(EXCEPTION.*?(?:NO_DATA_FOUND|TOO_MANY_ROW))/$1 STRICT $2 $3/igs;
+	# Add STRICT keyword when SELECT...INTO or EXECUTE ... INTO even if there's not EXCEPTION block
+	$str =~ s/\b((?:SELECT|EXECUTE)\s+[^;]*?\s+INTO)(\s+(?!STRICT))/$1 STRICT$2/igs;
+	$str =~ s/(INSERT\s+INTO\s+)STRICT\s+/$1/igs;
 
 	# Remove the function name repetion at end
-	$str =~ s/\bEND\s+(?!IF|LOOP|CASE|INTO|FROM|END|ELSE|AND|OR|WHEN|,)[a-z0-9_"]+(\s*[;]?)/END$1$2/igs;
+	$str =~ s/\b(END\s*[^;\s]+\s*(?:;|$))/remove_fct_name($1)/iges;
 
 	# Rewrite comment in CASE between WHEN and THEN
-	$str =~ s/(\s*)(WHEN\s+[^\s]+\s*)(ORA2PG_COMMENT\d+\%)(\s*THEN)/$1$3$1$2$4/igs;
+	$str =~ s/(\s*)(WHEN\s+[^\s]+\s*)(\%ORA2PG_COMMENT\d+\%)(\s*THEN)/$1$3$1$2$4/igs;
 
 	# Replace SQLCODE by SQLSTATE
 	$str =~ s/\bSQLCODE\b/SQLSTATE/igs;
 
 	# Revert order in FOR IN REVERSE
-	$str =~ s/FOR(.*?)IN\s+REVERSE\s+([^\.\s]+)\s*\.\.\s*([^\s]+)/FOR$1IN REVERSE $3..$2/isg;
+	$str =~ s/\bFOR(.*?)IN\s+REVERSE\s+([^\.\s]+)\s*\.\.\s*([^\s]+)/FOR$1IN REVERSE $3..$2/isg;
+
+	# Comment call to COMMIT or ROLLBACK in the code if allowed
+	if ($class->{comment_commit_rollback}) {
+		$str =~ s/\b(COMMIT|ROLLBACK)\s*;/-- $1;/igs;
+		$str =~ s/(ROLLBACK\s+TO\s+[^;]+);/-- $1;/igs;
+	}
+
+	# Comment call to SAVEPOINT in the code if allowed
+	if ($class->{comment_savepoint}) {
+		$str =~ s/(SAVEPOINT\s+[^;]+);/-- $1;/igs;
+	}
 
 	# Replace exit at end of cursor
-	$str =~ s/EXIT WHEN ([^\%]+)\%NOTFOUND\s*;/IF NOT FOUND THEN EXIT; END IF; -- apply on $1/isg;
-	$str =~ s/EXIT WHEN \(\s*([^\%]+)\%NOTFOUND\s*\)\s*;/IF NOT FOUND THEN EXIT; END IF; -- apply on $1/isg;
+	$str =~ s/EXIT WHEN ([^\%;]+)\%NOTFOUND\s*;/EXIT WHEN NOT FOUND; \/\* apply on $1 \*\//isg;
+	$str =~ s/EXIT WHEN \(\s*([^\%;]+)\%NOTFOUND\s*\)\s*;/EXIT WHEN NOT FOUND;  \/\* apply on $1 \*\//isg;
 	# Same but with additional conditions
-	$str =~ s/EXIT WHEN ([^\%]+)\%NOTFOUND\s+([;]+);/IF NOT FOUND $2 THEN EXIT; END IF; -- apply on $1/isg;
-	$str =~ s/EXIT WHEN \(\s*([^\%]+)\%NOTFOUND\s+([\)]+)\)\s*;/IF NOT FOUND $2 THEN EXIT; END IF; -- apply on $1/isg;
-	# Replacle call to SQL%NOTFOUND
+	$str =~ s/EXIT WHEN ([^\%;]+)\%NOTFOUND\s+([^;]+);/EXIT WHEN NOT FOUND $2;  \/\* apply on $1 \*\//isg;
+	$str =~ s/EXIT WHEN \(\s*([^\%;]+)\%NOTFOUND\s+([^\)]+)\)\s*;/EXIT WHEN NOT FOUND $2;  \/\* apply on $1 \*\//isg;
+	# Replacle call to SQL%NOTFOUND and SQL%FOUND
 	$str =~ s/SQL\%NOTFOUND/NOT FOUND/isg;
+	$str =~ s/SQL\%FOUND/FOUND/isg;
 
 	# Replace REF CURSOR as Pg REFCURSOR
 	$str =~ s/\bIS(\s*)REF\s+CURSOR/REFCURSOR/isg;
 	$str =~ s/\bREF\s+CURSOR/REFCURSOR/isg;
 
 	# Replace SYS_REFCURSOR as Pg REFCURSOR
-	$str =~ s/SYS_REFCURSOR/REFCURSOR/isg;
+	$str =~ s/\bSYS_REFCURSOR\b/REFCURSOR/isg;
+
+	# Replace UTL_MATH function by fuzzymatch function
+	$str =~ s/UTL_MATCH.EDIT_DISTANCE/levenshtein/igs;
 
 	# Replace known EXCEPTION equivalent ERROR code
-	$str =~ s/\bINVALID_CURSOR\b/INVALID_CURSOR_STATE/igs;
-	$str =~ s/\bZERO_DIVIDE\b/DIVISION_BY_ZERO/igs;
-	$str =~ s/\bSTORAGE_ERROR\b/OUT_OF_MEMORY/igs;
-	# PROGRAM_ERROR => INTERNAL ERROR ?
-	# ROWTYPE_MISMATCH => DATATYPE MISMATCH ?
+	foreach my $e (keys %EXCEPTION_MAP) {
+		$str =~ s/\b$e\b/$EXCEPTION_MAP{"\U$e\L"}/igs;
+	}
 
 	# Replace special IEEE 754 values for not a number and infinity
 	$str =~ s/BINARY_(FLOAT|DOUBLE)_NAN/'NaN'/igs;
@@ -591,7 +746,7 @@ sub plsql_to_plpgsql
 	#  Convert all x = NULL clauses to x IS NULL.
 	$str =~ s/(?!:)(.)=\s*NULL/$1 IS NULL/igs;
 	# Revert changes on update queries in the column setting part of the query
-	while ($str =~ s/(\bUPDATE\b[^;]+)\s+IS NULL(\s*(?!WHERE)([^;]+))/$1 = NULL$2/is) {};
+	while ($str =~ s/\b(UPDATE\s+[^;]+)\s+IS NULL(\s*(?!WHERE)([^;]*))/$1 = NULL$2/is) {};
 
 	# Rewrite all IF ... IS NULL with coalesce because for Oracle empty and NULL is the same
 	if ($class->{null_equal_empty}) {
@@ -604,14 +759,18 @@ sub plsql_to_plpgsql
 	}
 
 	# Replace type in sub block
-	$str =~ s/(DECLARE\s+)(.*?)(\s+BEGIN)/$1 . &replace_sql_type($2, $class->{pg_numeric_type}, $class->{default_numeric}, $class->{pg_integer_type}) . $3/iges;
+	if (!$class->{is_mysql}) {
+		$str =~ s/(BEGIN.*?DECLARE\s+)(.*?)(\s+BEGIN)/$1 . Ora2Pg::PLSQL::replace_sql_type($2, $class->{pg_numeric_type}, $class->{default_numeric}, $class->{pg_integer_type}, %data_type) . $3/iges;
+	} else {
+		$str =~ s/(BEGIN.*?DECLARE\s+)(.*?)(\s+BEGIN)/$1 . Ora2Pg::MySQL::replace_sql_type($2, $class->{pg_numeric_type}, $class->{default_numeric}, $class->{pg_integer_type}, %data_type) . $3/iges;
+	}
 
 	# Remove any call to MDSYS schema in the code
-	$str =~ s/MDSYS\.//igs;
+	$str =~ s/\bMDSYS\.//igs;
 
-	# Replace outer join sign (+) with a placeholder
-	$str =~ s/\(\+\)/\%OUTERJOIN\%/gs;
-
+	# Oracle doesn't require parenthesis after VALUES, PostgreSQL has
+	# similar proprietary syntax but parenthesis are mandatory
+	$str =~ s/(INSERT\s+INTO\s+(?:.*?)\s+VALUES\s+)([^\(\)\s]+)\s*;/$1\($2.*\);/igs;
 
 	$class->{sub_queries} = ();
 	$class->{sub_queries_idx} = 0;
@@ -684,10 +843,109 @@ sub plsql_to_plpgsql
 	$str =~ s/(\s+WHERE)\s+(AND|OR)\b/$1/igs;
 	$str =~ s/(\s+WHERE)(\s+\%ORA2PG_COMMENT\d+\%\s+)+(AND|OR)\b/$1$2/igs;
 
+	# Attempt to remove some extra parenthesis in simple case only
 	$str = remove_extra_parenthesis($str);
 
-	# Replace outer join sign (+) with a placeholder
-	$str =~ s/\%OUTERJOIN\%/\(\+\)/igs;
+	# Replace cast in partition range
+	$str =~ s/TIMESTAMP\s*('[^']+')/$1::timestamp/igs;
+	# Replace call to SQL%ROWCOUNT
+	$str =~ s/([^\s]+)\s*:=\s*SQL\%ROWCOUNT/GET DIAGNOSTICS $1 = ROW_COUNT/igs;
+	if ($str =~ s/(IF\s+)SQL\%ROWCOUNT/GET DIAGNOSTICS ora2pg_rowcount = ROW_COUNT;\n$1ora2pg_rowcount/igs) {
+		$class->{get_diagnostics} = 'ora2pg_rowcount int;';
+	}
+
+	# Sometime variable used in FOR ... IN SELECT loop is not declared
+	# Append its RECORD declaration in the DECLARE section.
+	my $tmp_code = $str;
+	while ($tmp_code =~ s/\bFOR\s+([^\s]+)\s+IN(.*?)LOOP//is) {
+		my $varname = $1;
+		my $clause = $2;
+		my @code = split(/\bBEGIN\b/i, $str);
+		if ($code[0] !~ /\bDECLARE\s+.*\b$varname\s+/is) {
+			# When the cursor is refereing to a statement, declare
+			# it as record otherwise it don't need to be replaced
+			if ($clause =~ /\bSELECT\b/is) {
+				# append variable declaration to declare section
+				if ($str !~ s/\bDECLARE\b/DECLARE\n  $varname RECORD;/is) {
+					# No declare section
+					$str = "DECLARE\n  $varname RECORD;\n" . $str;
+				}
+			}
+		}
+	}
+
+	# Rewrite direct call to function without out parameters using PERFORM
+	$str = perform_replacement($class, $str);
+
+	# Restore non converted outer join
+	$str =~ s/\%OUTERJOIN\d+\%/\(\+\)/igs;
+
+	return $str;
+}
+
+##############
+# Rewrite direct call to function without out parameters using PERFORM
+##############
+sub perform_replacement
+{
+	my ($class, $str) = @_;
+
+	if (uc($class->{type}) =~ /^(PACKAGE|FUNCTION|PROCEDURE|TRIGGER)$/) {
+		foreach my $sch ( keys %{ $class->{function_metadata} }) {
+			foreach my $p ( keys %{ $class->{function_metadata}{$sch} }) {
+				foreach my $k (keys %{$class->{function_metadata}{$sch}{$p}}) {
+					my $fct_name = $class->{function_metadata}{$sch}{$p}{$k}{metadata}{fct_name} || '';
+					next if (!$fct_name);
+					next if ($p ne 'none' && $str !~ /\b$p\.$fct_name\b/is && $str !~ /(^|[^\.])\b$fct_name\b/is);
+					next if ($p eq 'none' && $str !~ /\b$fct_name\b/is);
+					if (!$class->{function_metadata}{$sch}{$p}{$k}{metadata}{inout}) {
+						if ($sch ne 'unknown' and $str =~ /\b$sch.$k\b/is) {
+							# Look if we need to use PERFORM to call the function
+							$str =~ s/(BEGIN|LOOP|;)((?:\s*%ORA2PG_COMMENT\d+\%\s*|\s*\/\*(?:.*?)\*\/\s*)*\s*)($sch\.$k\s*[\(;])/$1$2PERFORM $3/igs;
+							$str =~ s/(EXCEPTION(?:(?!CASE|THEN).)*?THEN)((?:\s*%ORA2PG_COMMENT\d+\%\s*)*\s*)($sch\.$k\s*[\(;])/$1$2PERFORM $3/isg;
+							$str =~ s/(IF(?:(?!CASE|THEN).)*?THEN)((?:\s*%ORA2PG_COMMENT\d+\%\s*)*\s*)($sch\.$k\s*[\(;])/$1$2PERFORM $3/isg;
+							$str =~ s/(IF(?:(?!CASE|ELSE).)*?ELSE)((?:\s*%ORA2PG_COMMENT\d+\%\s*)*\s*)($sch\.$k\s*[\(;])/$1$2PERFORM $3/isg;
+							$str =~ s/(PERFORM $sch\.$k);/$1\(\);/igs;
+						} elsif ($str =~ /\b$k\b/is) {
+							# Look if we need to use PERFORM to call the function
+							$str =~ s/(BEGIN|LOOP|CALL|;)((?:\s*%ORA2PG_COMMENT\d+\%\s*|\s*\/\*(?:.*?)\*\/\s*)*\s*)($k\s*[\(;])/$1$2PERFORM $3/igs;
+							$str =~ s/(EXCEPTION(?:(?!CASE|THEN).)*?THEN)((?:\s*%ORA2PG_COMMENT\d+\%\s*)*\s*)($k\s*[\(;])/$1$2PERFORM $3/isg;
+							$str =~ s/(IF(?:(?!CASE|THEN).)*?THEN)((?:\s*%ORA2PG_COMMENT\d+\%\s*)*\s*)($k\s*[\(;])/$1$2PERFORM $3/isg;
+							$str =~ s/(IF(?:(?!CASE|ELSE).)*?ELSE)((?:\s*%ORA2PG_COMMENT\d+\%\s*)*\s*)($k\s*[\(;])/$1$2PERFORM $3/isg;
+							$str =~ s/(PERFORM $k);/$1\(\);/igs;
+						} else {
+							# Look if we need to use PERFORM to call the function
+							$str =~ s/(BEGIN|LOOP|;)((?:\s*%ORA2PG_COMMENT\d+\%\s*|\s*\/\*(?:.*?)\*\/\s*)*\s*)($fct_name\s*[\(;])/$1$2PERFORM $3/igs;
+							$str =~ s/(EXCEPTION(?:(?!CASE|THEN).)*?THEN)((?:\s*%ORA2PG_COMMENT\d+\%\s*)*\s*)($fct_name\s*[\(;])/$1$2PERFORM $3/isg;
+							$str =~ s/(IF(?:(?!CASE|THEN).)*?THEN)((?:\s*%ORA2PG_COMMENT\d+\%\s*)*\s*)($fct_name\s*[\(;])/$1$2PERFORM $3/isg;
+							$str =~ s/(IF(?:(?!CASE|ELSE).)*?ELSE)((?:\s*%ORA2PG_COMMENT\d+\%\s*)*\s*)($fct_name\s*[\(;])/$1$2PERFORM $3/isg;
+							$str =~ s/(PERFORM $fct_name);/$1\(\);/igs;
+						}
+					} else {
+						# Recover call to function with OUT parameter with double affectation
+						$str =~ s/([^:\s]+\s*:=\s*)[^:\s]*\s+:=\s*((?:[^\s\.]+\.)?\b$fct_name\s*\()/$1$2/isg;
+					}
+					# Remove package name and try to replace call to function name only
+					if (!$class->{function_metadata}{$sch}{$p}{$k}{metadata}{inout} && $k =~ s/^[^\.]+\.// && lc($p) eq lc($class->{current_package}) ) {
+						if ($sch ne 'unknown' and $str =~ /\b$sch\.$k\b/is) {
+							$str =~ s/(BEGIN|LOOP|;)((?:\s*%ORA2PG_COMMENT\d+\%\s*|\s*\/\*(?:.*?)\*\/\s*)*\s*)($sch\.$k\s*[\(;])/$1$2PERFORM $3/igs;
+							$str =~ s/(EXCEPTION(?:(?!CASE|THEN).)*?THEN)((?:\s*%ORA2PG_COMMENT\d+\%\s*)*\s*)($sch\.$k\s*[\(;])/$1$2PERFORM $3/isg;
+							$str =~ s/(IF(?:(?!CASE|THEN).)*?THEN)((?:\s*%ORA2PG_COMMENT\d+\%\s*)*\s*)($sch\.$k\s*[\(;])/$1$2PERFORM $3/isg;
+							$str =~ s/(IF(?:(?!CASE|ELSE).)*?ELSE)((?:\s*%ORA2PG_COMMENT\d+\%\s*)*\s*)($sch\.$k\s*[\(;])/$1$2PERFORM $3/isg;
+							$str =~ s/(PERFORM $sch\.$k);/$1\(\);/igs;
+						} elsif ($str =~ /\b$k\b/is) {
+							$str =~ s/(BEGIN|LOOP|CALL|;)((?:\s*%ORA2PG_COMMENT\d+\%\s*|\s*\/\*(?:.*?)\*\/\s*)*\s*)($k\s*[\(;])/$1$2PERFORM $3/igs;
+							$str =~ s/(EXCEPTION(?:(?!CASE|THEN).)*?THEN)((?:\s*%ORA2PG_COMMENT\d+\%\s*)*\s*)($k\s*[\(;])/$1$2PERFORM $3/isg;
+							$str =~ s/(IF(?:(?!CASE|THEN).)*?THEN)((?:\s*%ORA2PG_COMMENT\d+\%\s*)*\s*)($k\s*[\(;])/$1$2PERFORM $3/isg;
+							$str =~ s/(IF(?:(?!CASE|ELSE).)*?ELSE)((?:\s*%ORA2PG_COMMENT\d+\%\s*)*\s*)($k\s*[\(;])/$1$2PERFORM $3/isg;
+							$str =~ s/(PERFORM $k);/$1\(\);/igs;
+						}
+					}
+				}
+			}
+		}
+	}
+	$str =~ s/\bCALL\s+PERFORM/PERFORM/igs;
 
 	return $str;
 }
@@ -702,10 +960,10 @@ sub translate_statement
 		next if ($q[$j] =~ /^UNION/);
 
 		# Replace call to right outer join obsolete syntax
-		$q[$j] = replace_outer_join($q[$j], 'right');
+		$q[$j] = replace_outer_join($class, $q[$j], 'right');
 
 		# Replace call to left outer join obsolete syntax
-		$q[$j] = replace_outer_join($q[$j], 'left');
+		$q[$j] = replace_outer_join($class, $q[$j], 'left');
 
 		# Replace LIMIT into the main query
 		$q[$j] = replace_rownum_with_limit($class, $q[$j]);
@@ -723,31 +981,63 @@ sub translate_statement
 	# Remove unnecessary offset to position 0 which is the default
 	$stmt =~ s/\s+OFFSET 0//igs;
 
+	# Replacement of connect by with CTE
+	$stmt = replace_connect_by($class, $stmt);
+
 	return $stmt;
 }
-
-
 
 sub remove_extra_parenthesis
 {
 	my $str = shift;
 
 	while ($str =~ s/\(\s*\(((?!\s*SELECT)[^\(\)]+)\)\s*\)/($1)/gs) {};
-	while ($str =~ s/\(\s*\(([^\(\)]+)\)\s*AND\s*\(([^\(\)]+)\)\s*\)/($1 AND $2)/igs) {};
+	my %store_clause = ();
+	my $i = 0;
+	while ($str =~ s/\(\s*\(([^\(\)]+)\)\s*AND\s*\(([^\(\)]+)\)\s*\)/\%PARENTHESIS$i\%/is) {
+		$store_clause{$i} = find_or_parenthesis($1, $2);
+		$i++
+	}
+	$str =~ s/\%PARENTHESIS(\d+)\%/$store_clause{$1}/gs;
 	while ($str =~ s/\(\s*\(\s*\(([^\(\)]+\)[^\(\)]+\([^\(\)]+)\)\s*\)\s*\)/(($1))/gs) {};
 
 	return $str;
 }
 
+# When the statement include OR keep parenthesisœ
+sub find_or_parenthesis
+{
+	my ($left, $right) = @_;
+
+	if ($left =~ /\s+OR\s+/i) {
+		$left = "($left)";
+	}
+	if ($right =~ /\s+OR\s+/i) {
+		$right = "($right)";
+	}
+
+	return "($left AND $right)";
+}
+
+
 sub extract_subpart
 {
 	my ($class, $str) = @_;
 
-	while ($$str =~ s/\(([^\(\)]*)\)/\%SUBQUERY$class->{sub_parts_idx}\%/is) {
+	while ($$str =~ s/\(([^\(\)]*)\)/\%SUBQUERY$class->{sub_parts_idx}\%/s) {
 		$class->{sub_parts}{$class->{sub_parts_idx}} = $1;
 		$class->{sub_parts_idx}++;
 	}
-
+	my @done = ();
+	foreach my $k (sort { $b <=> $a } %{$class->{sub_parts}}) {
+		if ($class->{sub_parts}{$k} =~ /\%OUTERJOIN\d+\%/ && $class->{sub_parts}{$k} !~ /\b(SELECT|FROM|WHERE)\b/i) {
+			$$str =~ s/\%SUBQUERY$k\%/\($class->{sub_parts}{$k}\)/s;
+			push(@done, $k);
+		}
+	}
+	foreach (@done) {
+		delete $class->{sub_parts}{$_};
+	}
 }
 
 
@@ -795,45 +1085,65 @@ sub replace_rownum_with_limit
 {
 	my ($class, $str) = @_;
 
-        if ($str =~ s/\s+(WHERE)\s+(?:\(\s*)?ROWNUM\s*=\s*(\d+)(\s*\)\s*)?([^;]*)/ $1 $3$4/is) {
-		$class->{limit_clause} = ' LIMIT 1 OFFSET ' . ($2-1);
+	my $offset = '';
+        if ($str =~ s/\s+(WHERE)\s+(?:\(\s*)?ROWNUM\s*=\s*([^\s\)]+)(\s*\)\s*)?([^;]*)/ $1 $3$4/is) {
+		$offset = $2;
+		($offset =~ /[^0-9]/) ? $offset = "($offset)" : $offset -= 1;
+		$class->{limit_clause} = ' LIMIT 1 OFFSET ' . $offset;
 		
         }
-	if ($str =~ s/\s+AND\s+(?:\(\s*)?ROWNUM\s*=\s*(\d+)(\s*\)\s*)?([^;]*)/ $2$3/is) {
-		$class->{limit_clause} = ' LIMIT 1 OFFSET ' . ($1-1);
+	if ($str =~ s/\s+AND\s+(?:\(\s*)?ROWNUM\s*=\s*([^\s\)]+)(\s*\)\s*)?([^;]*)/ $2$3/is) {
+		$offset = $1;
+		($offset =~ /[^0-9]/) ? $offset = "($offset)" : $offset -= 1;
+		$class->{limit_clause} = ' LIMIT 1 OFFSET ' . $offset;
         }
 
-	if ($str =~ s/\s+(WHERE)\s+(?:\(\s*)?ROWNUM\s*>=\s*(\d+)(\s*\)\s*)?([^;]*)/ $1 $3$4/is) {
-		$class->{limit_clause} = ' LIMIT ALL OFFSET ' . ($2-1);
+	if ($str =~ s/\s+(WHERE)\s+(?:\(\s*)?ROWNUM\s*>=\s*([^\s\)]+)(\s*\)\s*)?([^;]*)/ $1 $3$4/is) {
+		$offset = $2;
+		($offset =~ /[^0-9]/) ? $offset = "($offset)" : $offset -= 1;
+		$class->{limit_clause} = ' LIMIT ALL OFFSET ' . $offset;
         }
-	if ($str =~ s/\s+(WHERE)\s+(?:\(\s*)?ROWNUM\s*>\s*(\d+)(\s*\)\s*)?([^;]*)/ $1 $3$4/is) {
-		$class->{limit_clause} = ' LIMIT ALL OFFSET ' . $2;
+	if ($str =~ s/\s+(WHERE)\s+(?:\(\s*)?ROWNUM\s*>\s*([^\s\)]+)(\s*\)\s*)?([^;]*)/ $1 $3$4/is) {
+		$offset = $2;
+		$offset = "($offset)" if ($offset =~ /[^0-9]/);
+		$class->{limit_clause} = ' LIMIT ALL OFFSET ' . $offset;
 	}
-	if ($str =~ s/\s+AND\s+(?:\(\s*)?ROWNUM\s*>=\s*(\d+)(\s*\)\s*)?([^;]*)/ $2$3/is) {
-		$class->{limit_clause} = ' LIMIT ALL OFFSET ' . ($1-1);
+	if ($str =~ s/\s+AND\s+(?:\(\s*)?ROWNUM\s*>=\s*([^\s\)]+)(\s*\)\s*)?([^;]*)/ $2$3/is) {
+		$offset = $1;
+		($offset =~ /[^0-9]/) ? $offset = "($offset)" : $offset -= 1;
+		$class->{limit_clause} = ' LIMIT ALL OFFSET ' . $offset;
         }
-	if ($str =~ s/\s+AND\s+(?:\(\s*)?ROWNUM\s*>\s*(\d+)(\s*\)\s*)?([^;]*)/ $2$3/is) {
-		$class->{limit_clause} = ' LIMIT ALL OFFSET ' . $1;
+	if ($str =~ s/\s+AND\s+(?:\(\s*)?ROWNUM\s*>\s*([^\s\)]+)(\s*\)\s*)?([^;]*)/ $2$3/is) {
+		$offset = $1;
+		$offset = "($offset)" if ($offset =~ /[^0-9]/);
+		$class->{limit_clause} = ' LIMIT ALL OFFSET ' . $offset;
 	}
 
 	my $tmp_val = '';
-	if ($str =~ s/\s+(WHERE)\s+(?:\(\s*)?ROWNUM\s*<=\s*(\d+)(\s*\)\s*)?([^;]*)/ $1 $3$4/is) {
+	if ($str =~ s/\s+(WHERE)\s+(?:\(\s*)?ROWNUM\s*<=\s*([^\s\)]+)(\s*\)\s*)?([^;]*)/ $1 $3$4/is) {
 		$tmp_val = $2;
 	}
-	if ($str =~ s/\s+(WHERE)\s+(?:\(\s*)?ROWNUM\s*<\s*(\d+)(\s*\)\s*)?([^;]*)/ $1 $3$4/is) {
+	if ($str =~ s/\s+(WHERE)\s+(?:\(\s*)?ROWNUM\s*<\s*([^\s\)]+)(\s*\)\s*)?([^;]*)/ $1 $3$4/is) {
 		$tmp_val = $2 - 1;
         }
-	if ($str =~ s/\s+AND\s+(?:\(\s*)?ROWNUM\s*<=\s*(\d+)(\s*\)\s*)?([^;]*)/ $2$3/is) {
+	if ($str =~ s/\s+AND\s+(?:\(\s*)?ROWNUM\s*<=\s*([^\s\)]+)(\s*\)\s*)?([^;]*)/ $2$3/is) {
 		$tmp_val = $1;
         }
-	if ($str =~ s/\s+AND\s+(?:\(\s*)?ROWNUM\s*<\s*(\d+)(\s*\)\s*)?([^;]*)/ $2$3/is) {
+	if ($str =~ s/\s+AND\s+(?:\(\s*)?ROWNUM\s*<\s*([^\s\)]+)(\s*\)\s*)?([^;]*)/ $2$3/is) {
 		$tmp_val = $1 - 1;
         }
+
 	if ($tmp_val) {
-		if ($class->{limit_clause} =~ /LIMIT ALL OFFSET (\d+)/is) {
-			$tmp_val -= $1;
+		if ($class->{limit_clause} =~ /LIMIT ALL OFFSET ([^\s]+)/is) {
+			my $tmp_offset = $1;
+			if ($tmp_offset !~ /[^0-9]/ && $tmp_val !~ /[^0-9]/) {
+				$tmp_val -= $tmp_offset;
+			} else {
+				$tmp_val = "($tmp_val - $tmp_offset)";
+			}
 			$class->{limit_clause} =~ s/LIMIT ALL/LIMIT $tmp_val/is;
 		} else {
+			$tmp_val = "($tmp_val)" if ($tmp_val =~ /[^0-9]/);
 			$class->{limit_clause} = ' LIMIT ' . $tmp_val;
 		}
 	}
@@ -849,6 +1159,106 @@ sub replace_rownum_with_limit
 	return $str;
 }
 
+# Translation of REGEX_SUBSTR( string, pattern, [pos], [nth]) converted into
+# (SELECT array_to_string(a, '') FROM regexp_matches(substr(string, pos), pattern, 'g') AS foo(a) LIMIT 1 OFFSET (nth - 1))";
+# Optional fith parameter of match_parameter is appended to 'g' when present
+sub convert_regex_substr
+{
+	($class, $str) = @_;
+
+	my @params = split(/\s*,\s*/, $str);
+	my $mod = '';
+	if ($#params == 4) {
+		# Restore constant string to look into date format
+		while ($params[4] =~ s/\?TEXTVALUE(\d+)\?/$class->{text_values}{$1}/is) {
+			delete $class->{text_values}{$1};
+		}
+		$params[4] =~ s/'//g;
+		$mod = $params[4] if ($params[4] ne 'g');
+	}
+	if ($#params < 2) {
+		push(@params, 1, 1);
+	} elsif ($#params < 3) {
+		push(@params, 1);
+	}
+	if ($params[2] == 1) {
+		$str = "(SELECT array_to_string(a, '') FROM regexp_matches($params[0], $params[1], 'g$mod') AS foo(a) LIMIT 1 OFFSET ($params[3] - 1))";
+	} else {
+		$str = "(SELECT array_to_string(a, '') FROM regexp_matches(substr($params[0], $params[2]), $params[1], 'g$mod') AS foo(a) LIMIT 1 OFFSET ($params[3] - 1))";
+	}
+
+	return $str;
+}
+
+sub convert_from_tz
+{
+	my ($class, $date) = @_;
+
+	# Restore constant string to look into date format
+	while ($date =~ s/\?TEXTVALUE(\d+)\?/$class->{text_values}{$1}/is) {
+		delete $class->{text_values}{$1};
+	}
+
+	my $tz = '00:00';
+	if ($date =~ /^[^']*'([^']+)'\s*,\s*'([^']+)'/) {
+		$date = $1;
+		$tz = $2;
+		$date = $date . ' ';
+		if ($tz =~ /^\d+:\d+$/) {
+			$date .= '+' . $tz;
+		} else {
+			$date .= $tz;
+		}
+		$date = "'$date'";
+	} elsif ($date =~ /^(.*),\s*'([^']+)'$/) {
+		$date = $1;
+		$tz = $2;
+		if ($tz =~ /^\d+:\d+$/) {
+			$tz .= '+' . $tz;
+		}
+		$date = $date . ' AT TIME ZONE ' . "'$tz'";
+	}
+
+	# Replace constant strings
+	while ($date =~ s/('[^']+')/\?TEXTVALUE$class->{text_values_pos}\?/s) {
+		$class->{text_values}{$class->{text_values_pos}} = $1;
+		$class->{text_values_pos}++;
+	}
+
+	return $date;
+}
+
+sub convert_date_format
+{
+	my ($class, $fields) = @_;
+
+	# Restore constant string to look into date format
+	while ($fields =~ s/\?TEXTVALUE(\d+)\?/$class->{text_values}{$1}/is) {
+		delete $class->{text_values}{$1};
+	}
+
+	# Truncate time to microsecond
+	$fields =~ s/(\d{2}:\d{2}:\d{2}[,\.]\d{6})\d{3}/$1/s;
+
+	# Replace round year with two digit year format.
+	$fields =~ s/RR/YY/sg;
+
+	# Convert fractional seconds to milli (MS) or micro (US) seconds
+	$fields =~ s/FF[123]/MS/s;
+	$fields =~ s/FF\d*/US/s;
+
+	# Remove any timezone format
+	$fields =~ s/\s*TZ[DHMR]//gs;
+
+	# Replace constant strings
+	while ($str =~ s/('[^']+')/\?TEXTVALUE$class->{text_values_pos}\?/s) {
+		$class->{text_values}{$class->{text_values_pos}} = $1;
+		$class->{text_values_pos}++;
+	}
+	return $fields;
+}
+
+
 sub replace_oracle_function
 {
         my ($class, $str) = @_;
@@ -862,11 +1272,14 @@ sub replace_oracle_function
 	# PL/SQL to PL/PGSQL code conversion
 	# Feel free to add your contribution here.
 	#--------------------------------------------
+
+	if ($class->{is_mysql}) {
+		$str = mysql_to_plpgsql($class, $str);
+	}
+
 	# Change NVL to COALESCE
 	$str =~ s/NVL\s*\(/coalesce(/is;
-
-	# Raise information to the client
-	$str =~ s/DBMS_OUTPUT\.(put_line|put|new_line)\s*\((.*)\)/&raise_output($2)/ise;
+	$str =~ s/NVL2\s*\($field,$field,$field\)/coalesce($1,$3)/is;
 
 	# Replace DEFAULT empty_blob() and empty_clob()
 	$str =~ s/(empty_blob|empty_clob)\s*\(\s*\)//is;
@@ -877,19 +1290,41 @@ sub replace_oracle_function
 	$str =~ s/\bSYS_GUID\b/$class->{uuid_function}()/is;
 
 	# Rewrite TO_DATE formating call
-	$str =~ s/TO_DATE\s*\(\s*('[^\']+'),\s*('[^\']+')[^\)]*\)/to_date($1,$2)/is;
+	$str =~ s/TO_DATE\s*\(\s*('[^\']+')\s*,\s*('[^\']+')[^\)]*\)/to_date($1,$2)/is;
+
+	# Translate to_timestamp_tz Oracle function
+	$str =~ s/TO_TIMESTAMP_TZ\s*\((.*)\)/'to_timestamp(' . convert_date_format($class, $1) . ')'/ies;
+
+	# Translate from_tz Oracle function
+	$str =~ s/FROM_TZ\s*\(\s*([^\)]+)\s*\)/'(' . convert_from_tz($class,$1) . ')::timestamp with time zone'/ies;
 
 	# Replace call to trim into btrim
-	$str =~ s/\bTRIM\s*\(([^\(\)]+)\)/btrim($1)/is;
+	$str =~ s/\bTRIM\s*\(([^\(\)]+)\)/trim(both $1)/is;
 
-	if ($class->{date_function_rewrite}) {
+	# Do some transformation when Orafce is not used
+	if (!$class->{use_orafce}) {
+		# Replace to_char() without format by a simple cast to text
+		$str =~ s/\bTO_CHAR\s*\($field\)/$1::varchar/is;
 		# Change trunc() to date_trunc('day', field)
 		# Trunc is replaced with date_trunc if we find date in the name of
 		# the value because Oracle have the same trunc function on number
 		# and date type
 		$str =~ s/\bTRUNC\s*\($date_field\)/date_trunc('day', $1)/is;
-		$str =~ s/\bTRUNC\s*\($date_field,$field\)/date_trunc($2, $1)/is;
-		$str =~ s/date_trunc\('MM'/date_trunc('month'/is;
+		if ($str =~ s/\bTRUNC\s*\($date_field,$field\)/date_trunc($2, $1)/is ||
+		    # Case where the parameters are obfuscated by function and string placeholders
+		    $str =~ s/\bTRUNC\((\%\%REPLACEFCT\d+\%\%)\s*,\s*(\?TEXTVALUE\d+\?)\)/date_trunc($2, $1)/is
+		) {
+			if ($str =~ /date_trunc\(\?TEXTVALUE(\d+)\?/) {
+				my $k = $1;
+				$class->{text_values}{$k} =~ s/'(SYYYY|SYEAR|YEAR|[Y]+)'/'year'/is;
+				$class->{text_values}{$k} =~ s/'Q'/'quarter'/is;
+				$class->{text_values}{$k} =~ s/'(MONTH|MON|MM|RM)'/'month'/is;
+				$class->{text_values}{$k} =~ s/'(IW|DAY|DY|D)'/'week'/is;
+				$class->{text_values}{$k} =~ s/'(DDD|DD|J)'/'day'/is;
+				$class->{text_values}{$k} =~ s/'(HH|HH12|HH24)'/'hour'/is;
+				$class->{text_values}{$k} =~ s/'MI'/'minute'/is;
+			}
+		}
 
 		# Convert the call to the Oracle function add_months() into Pg syntax
 		$str =~ s/ADD_MONTHS\s*\(([^,]+),\s*(\d+)\s*\)/$1 + '$2 month'::interval/si;
@@ -898,24 +1333,35 @@ sub replace_oracle_function
 		# Convert the call to the Oracle function add_years() into Pg syntax
 		$str =~ s/ADD_YEARS\s*\(([^,]+),\s*(\d+)\s*\)/$1 + '$2 year'::interval/si;
 		$str =~ s/ADD_YEARS\s*\(([^,]+),\s*([^,\(\)]+)\s*\)/$1 + $2*' year'::interval/si;
+
+		# Translate numtodsinterval Oracle function
+		$str =~ s/(?:NUMTODSINTERVAL|NUMTOYMINTERVAL)\s*\(\s*([^,]+)\s*,\s*([^\)]+)\s*\)/($1 * ('1'||$2)::interval)/is;
+
 	}
 
 	# Replace INSTR by POSITION
-	$str =~ s/\bINSTR\s*\(\s*([^,]+),\s*('[^']+')\s*\)/POSITION($2 in $1)/is;
+	$str =~ s/\bINSTR\s*\(\s*([^,]+),\s*([^\),]+)\s*\)/position($2 in $1)/is;
+	$str =~ s/\bINSTR\s*\(\s*([^,]+),\s*([^,]+)\s*,\s*1\s*\)/position($2 in $1)/is;
 
 	# The to_number() function reclaim a second argument under postgres which is the format.
-	# By default we use '99999999999999999999D99999999999999999999' that may allow bigint
-	# and double precision number. Feel free to modify it
-	#$str =~ s/TO_NUMBER\s*\(([^,\)]+)\)/to_number\($1,'99999999999999999999D99999999999999999999'\)/is;
-
-	# Replace to_number with a cast
-	$str =~ s/TO_NUMBER\s*\(\s*([^\)]+)\s*\)/($1)\:\:integer/is;
+	# Replace to_number with a cast when no specific format is given
+	if (lc($class->{to_number_conversion}) ne 'none') {
+		if ($class->{to_number_conversion} =~ /(numeric|bigint|integer|int)/i) {
+			my $cast = lc($1);
+			$str =~ s/\bTO_NUMBER\s*\(\s*([^,\)]+)\s*\)\s?/($1)\:\:$cast /is;
+		} else {
+			$str =~ s/\bTO_NUMBER\s*\(\s*([^,\)]+)\s*\)/to_number\($1,'$class->{to_number_conversion}'\)/is;
+		}
+	}
 
 	# Replace the UTC convertion with the PG syntaxe
 	$str =~ s/SYS_EXTRACT_UTC\s*\(([^\)]+)\)/($1 AT TIME ZONE 'UTC')/is;
 
 	# REGEX_LIKE( string, pattern ) => string ~ pattern
-	$str =~ s/REGEXP_LIKE\s*\(\s*([^,]+)\s*,\s*('[^\']+')\s*\)/$1 \~ $2/is;
+	$str =~ s/REGEXP_LIKE\s*\(\s*([^,]+)\s*,\s*([^\)]+)\s*\)/$1 \~ $2/is;
+
+	# REGEX_SUBSTR( string, pattern, pos, num ) translation
+	$str =~ s/REGEXP_SUBSTR\s*\(\s*([^\)]+)\s*\)/convert_regex_substr($class, $1)/iges;
 
 	# Remove call to XMLCDATA, there's no such function with PostgreSQL
 	$str =~ s/XMLCDATA\s*\(([^\)]+)\)/'<![CDATA[' || $1 || ']]>'/is;
@@ -925,34 +1371,122 @@ sub replace_oracle_function
 	$str =~ s/XMLELEMENT\s*\(\s*/XMLELEMENT(name /is;
 
 	# Cast round() call as numeric
-	$str =~ s/round\s*\(([^,]+),([\s\d]+)\)/round\(($1)::numeric,$2\)/igs;
+	$str =~ s/round\s*\(([^,]+),([\s\d]+)\)/round\(($1)::numeric,$2\)/is;
 
-	# Replace SDO_GEOM to the postgis equivalent
-	$str = &replace_sdo_function($str);
+	if ($str =~ /SDO_/is) {
+		# Replace SDO_GEOM to the postgis equivalent
+		$str = &replace_sdo_function($str);
 
-	# Replace Spatial Operator to the postgis equivalent
-	$str = &replace_sdo_operator($str);
+		# Replace Spatial Operator to the postgis equivalent
+		$str = &replace_sdo_operator($str);
+	}
 
 	# Rewrite replace(a,b) with three argument
 	$str =~ s/REPLACE\s*\($field,$field\)/replace($1, $2, '')/is;
 
-	##############
-	# Replace package.function call by package_function
-	##############
-	if (scalar keys %{$class->{package_functions}}) {
-		$str = $class->remove_text_constant_part($str);
-		foreach my $k (keys %{$class->{package_functions}}) {
-			$str =~ s/($class->{package_functions}->{$k}{package}\.)?\b$k\s*\(/$class->{package_functions}->{$k}{name}\(/igs;
-		}
-		$str = $class->restore_text_constant_part($str);
+	# Replace Oracle substr(string, start_position, length) with
+	# PostgreSQL substring(string from start_position for length)
+	$str =~ s/\bsubstrb\s*\(/substr\(/igs;
+	if (!$class->{pg_supports_substr}) {
+		$str =~ s/\bsubstr\s*\($field,$field,$field\)/substring($1 from $2 for $3)/is;
+		$str =~ s/\bsubstr\s*\($field,$field\)/substring($1 from $2)/is;
 	}
 
+	# Replace call to function with out parameters
+	$str = replace_out_param_call($class, $str);
+
 	# Replace some sys_context call to the postgresql equivalent
-	replace_sys_context($str);
+	if ($str =~ /SYS_CONTEXT/is) {
+		replace_sys_context($str);
+	}
 
 	return $str;
 }
 
+##############
+# Replace call to function with out parameters
+##############
+sub replace_out_param_call
+{
+	my ($class, $str) = @_;
+
+	if (uc($class->{type}) =~ /^(PACKAGE|FUNCTION|PROCEDURE|TRIGGER)$/) {
+		foreach my $sch (sort keys %{$class->{function_metadata}}) {
+			foreach my $p (sort keys %{$class->{function_metadata}{$sch}}) {
+				foreach my $k (sort keys %{$class->{function_metadata}{$sch}{$p}}) {
+					if ($class->{function_metadata}{$sch}{$p}{$k}{metadata}{inout}) {
+						my $fct_name = $class->{function_metadata}{$sch}{$p}{$k}{metadata}{fct_name} || '';
+						next if (!$fct_name);
+						next if ($p eq 'none' && $str !~ /\b$fct_name\b/is);
+						next if ($p ne 'none' && $str !~ /\b$p\.$fct_name\b/is && $str !~ /(^|[^\.])\b$fct_name\b/is);
+
+						# Prevent replacement with same function name from an other package
+						next if ($class->{current_package} && lc($p) ne lc($class->{current_package}) && $str =~ /(^|[^\.])\b$fct_name\b/is);
+
+						my %replace_out_parm = ();
+						my $idx = 0;
+						while ($str =~ s/((?:[^\s\.]+\.)?\b$fct_name)\s*\(([^\(\)]+)\)/\%FCTINOUTPARAM$idx\%/is) {
+							my $fname = $1;
+							my $fparam = $2;
+							if ($fname =~ /\./ && lc($fname) ne lc($k)) {
+								$replace_out_parm{$idx} = "$fname($fparam)";
+								next;
+							}
+							$replace_out_parm{$idx} = "$fname(";
+							# Extract position of out parameters
+							my @params = split(/\s*,\s*/, $class->{function_metadata}{$sch}{$p}{$k}{metadata}{args});
+							my @cparams = split(/\s*,\s*/, $fparam);
+							my $call_params = '';
+							my @out_pos = ();
+							my @out_fields = ();
+							for (my $i = 0; $i <= $#params; $i++) {
+								if (!$class->{is_mysql} && $params[$i] =~ /\s*([^\s]+)\s+(OUT|INOUT)\s/is) {
+									push(@out_fields, $1);
+									push(@out_pos, $i);
+									$call_params .= $cparams[$i] if ($params[$i] =~ /\bINOUT\b/is);
+								} elsif ($class->{is_mysql} && $params[$i] =~ /\s*(OUT|INOUT)\s+([^\s]+)\s/is) {
+									push(@out_fields, $2);
+									push(@out_pos, $i);
+									$call_params .= $cparams[$i] if ($params[$i] =~ /\bINOUT\b/is);
+								} else {
+									$call_params .= $cparams[$i];
+								}
+								$call_params .= ", " if ($i < $#params);
+							}
+							map { s/^\(//; } @out_fields;
+							$call_params =~ s/(\s*,\s*)+$//s;
+							while ($call_params =~ s/\s*,\s*,\s*/, /s) {};
+							$call_params =~ s/^(\s*,\s*)+//s;
+							$replace_out_parm{$idx} .= "$call_params)";
+							my @out_param = ();
+							foreach my $i (@out_pos) {
+								push(@out_param, $cparams[$i]);
+							}
+							if ($class->{function_metadata}{$sch}{$p}{$k}{metadata}{inout} == 1) {
+								if ($#out_param == 0) {
+									$replace_out_parm{$idx} = "$out_param[0] := $replace_out_parm{$idx}";
+								} else {
+									$replace_out_parm{$idx} = "SELECT * FROM $replace_out_parm{$idx} INTO " . join(', ', @out_param);
+								}
+							} elsif ($class->{function_metadata}{$sch}{$p}{$k}{metadata}{inout} > 1) {
+								$class->{replace_out_params} = "_ora2pg_r RECORD;" if (!$class->{replace_out_params});
+								$replace_out_parm{$idx} = "SELECT * FROM $replace_out_parm{$idx} INTO _ora2pg_r;";
+								my $out_field_pos = 0;
+								foreach $param (@out_param) {
+									$replace_out_parm{$idx} .= " $param := _ora2pg_r.$out_fields[$out_field_pos++];";
+								}
+								$replace_out_parm{$idx} =~ s/;$//s;
+							}
+							$idx++;
+						}
+						$str =~ s/\%FCTINOUTPARAM(\d+)\%/$replace_out_parm{$1}/gs;
+					}
+				}
+			}
+		}
+	}
+	return $str;
+}
 
 # Replace decode("user_status",'active',"username",null)
 # PostgreSQL (CASE WHEN "user_status"='ACTIVE' THEN "username" ELSE NULL END)
@@ -982,13 +1516,15 @@ sub replace_decode
 				if ($c eq ',' && ($idx - 1) == 0) {
 					# we are switching to a new parameter
 					push(@decode_params, '');
-				} else {
+				} elsif ($c ne "\n") {
 					$decode_params[-1] .= $c;
 				}
 			}
 		}
 		my $case_str = 'CASE ';
 		for (my $i = 1; $i <= $#decode_params; $i+=2) {
+			$decode_params[$i] =~ s/^\s+//gs;
+			$decode_params[$i] =~ s/\s+$//gs;
 			if ($i < $#decode_params) {
 				$case_str .= "WHEN $decode_params[0]=$decode_params[$i] THEN $decode_params[$i+1] ";
 			} else {
@@ -1156,42 +1692,54 @@ sub replace_sdo_operator
 # dbms_output.new_line by a plpgsql code
 sub raise_output
 {
-	my $str = shift;
+	my ($class, $str) = @_;
 
 	my @strings = split(/\s*\|\|\s*/s, $str);
 
 	my @params = ();
-	my $pattern = '';
+	my @pattern = ();
 	foreach my $el (@strings) {
-		if ($el =~ /^'(.*)'$/s) {
-			$pattern .= $1;
+		$el =~ s/\?TEXTVALUE(\d+)\?/$class->{text_values}{$1}/gs;
+		$el =~ s/ORA2PG_ESCAPE2_QUOTE/''/gs;
+		$el =~ s/ORA2PG_ESCAPE1_QUOTE'/\\'/gs;
+		if ($el =~ /^\s*'(.*)'\s*$/s) {
+			push(@pattern, $1);
 		} else {
-			$pattern .= '%';
+			push(@pattern, '%');
 			push(@params, $el);
 		}
 	}
-	my $ret = "RAISE NOTICE '$pattern'";
+	#my $ret = "RAISE NOTICE '$pattern'";
+	my $ret = "'" . join('', @pattern) . "'";
+	$ret =~ s/\%\%/\% \%/gs;
 	if ($#params >= 0) {
 		$ret .= ', ' . join(', ', @params);
 	}
 
-	return $ret;
+	return 'RAISE NOTICE ' . $ret;
 }
 
 sub replace_sql_type
 {
-        my ($str, $pg_numeric_type, $default_numeric, $pg_integer_type) = @_;
+        my ($str, $pg_numeric_type, $default_numeric, $pg_integer_type, %data_type) = @_;
 
 
 	$str =~ s/with local time zone/with time zone/igs;
-	$str =~ s/([A-Z])ORA2PG_COMMENT/$1 ORA2PG_COMMENT/igs;
+	$str =~ s/([A-Z])\%ORA2PG_COMMENT/$1 \%ORA2PG_COMMENT/igs;
+
+	# Replace MySQL type UNSIGNED in cast
+	$str =~ s/UNSIGNED\s*\)/bigint)/is;
 
 	# Replace type with precision
-	my $oratype_regex = join('|', keys %Ora2Pg::TYPE);
+	my @ora_type = keys %data_type;
+	map { s/\(/\\\(/; s/\)/\\\)/; } @ora_type;
+	my $oratype_regex = join('|', @ora_type);
+
 	while ($str =~ /(.*)\b($oratype_regex)\s*\(([^\)]+)\)/i) {
 		my $backstr = $1;
 		my $type = uc($2);
 		my $args = $3;
+
 		# Remove extra CHAR or BYTE information from column type
 		$args =~ s/\s*(CHAR|BYTE)\s*$//i;
 		if ($backstr =~ /_$/) {
@@ -1207,7 +1755,7 @@ sub replace_sql_type
 			# Type CHAR have default length set to 1
 			# Type VARCHAR(2) must have a specified length
 			$len = 1 if (!$len && (($type eq "CHAR") || ($type eq "NCHAR")));
-			$str =~ s/\b$type\b\s*\([^\)]+\)/$Ora2Pg::TYPE{$type}\%\|$len\%\|\%/is;
+			$str =~ s/\b$type\b\s*\([^\)]+\)/$data_type{$type}\%\|$len\%\|\%/is;
 		} elsif ($type =~ /TIMESTAMP/i) {
 			$len = 6 if ($len > 6);
 			$str =~ s/\b$type\b\s*\([^\)]+\)/timestamp\%\|$len%\|\%/is;
@@ -1268,7 +1816,7 @@ sub replace_sql_type
 	$str =~ s/\%\|/\(/gs;
 
         # Replace datatype without precision
-	my $number = $Ora2Pg::TYPE{'NUMBER'};
+	my $number = $data_type{'NUMBER'};
 	$number = $default_numeric if ($pg_integer_type);
 	$str =~ s/\bNUMBER\b/$number/igs;
 
@@ -1277,22 +1825,32 @@ sub replace_sql_type
 	$str =~ s/\bSTRING\b/VARCHAR/igs;
 	$str =~ s/\bVARCHAR(\s*(?!\())/text$1/igs;
 
-	foreach my $t ('DATE','LONG RAW','LONG','NCLOB','CLOB','BLOB','BFILE','RAW','ROWID','FLOAT','DOUBLE PRECISION','INTEGER','INT','REAL','SMALLINT','BINARY_FLOAT','BINARY_DOUBLE','BINARY_INTEGER','BOOLEAN','XMLTYPE','SDO_GEOMETRY') {
-		$str =~ s/\b$t\b/$Ora2Pg::TYPE{$t}/igs;
+	foreach my $t ('DATE','LONG RAW','LONG','NCLOB','CLOB','BLOB','BFILE','RAW','ROWID','UROWID','FLOAT','DOUBLE PRECISION','INTEGER','INT','REAL','SMALLINT','BINARY_FLOAT','BINARY_DOUBLE','BINARY_INTEGER','BOOLEAN','XMLTYPE','SDO_GEOMETRY') {
+		$str =~ s/\b$t\b/$data_type{$t}/igs;
 	}
 
 	# Replace local type ref cursor
 	my %locatype = ();
 	my $i = 0;
-	while ($str =~ s/\bTYPE\s+([^\s]+)\s+IS\s+REF\s+CURSOR\s*;/\%LOCALTYPE$i\%/is) {
+	while ($str =~ s/\bTYPE\s+([^\s]+)\s+(IS\s+REF\s+CURSOR|REFCURSOR)\s*;/\%LOCALTYPE$i\%/is) {
 		$localtype{$i} = "TYPE $1 IS REF CURSOR;";
 		my $local_type = $1;
-		if ($str =~ s/\b([^\s]+)\s+$local_type\s*;/$1 REFCURSOR;/is) {
-			$str =~ s/\%LOCALTYPE$i\%//is;
+		if ($str =~ s/\b([^\s]+)\s+$local_type\s*;/$1 REFCURSOR;/igs) {
+			$str =~ s/\%LOCALTYPE$i\%//igs;
 		}
 		$i++;
 	}
 	$str =~ s/\%LOCALTYPE(\d+)\%/$localtype{$1}/gs;
+	$str =~ s/\%ROWTYPE//gs;
+
+	# Replace REF CURSOR as Pg REFCURSOR
+	$str =~ s/\bIS(\s*)REF\s+CURSOR/REFCURSOR/isg;
+	$str =~ s/\bREF\s+CURSOR/REFCURSOR/isg;
+
+	# Replace SYS_REFCURSOR as Pg REFCURSOR
+	$str =~ s/\bSYS_REFCURSOR\b/REFCURSOR/isg;
+
+	$str =~ s/;[ ]+/;/gs;
 
         return $str;
 }
@@ -1348,6 +1906,8 @@ sub estimate_cost
 	$cost_details{'NOTFOUND'} += $n;
 	$n = () = $str =~ m/\bROWID\b/igs;
 	$cost_details{'ROWID'} += $n;
+	$n = () = $str =~ m/\bUROWID\b/igs;
+	$cost_details{'UROWID'} += $n;
 	$n = () = $str =~ m/\bSQLSTATE\b/igs;
 	$cost_details{'SQLCODE'} += $n;
 	$n = () = $str =~ m/\bIS RECORD\b/igs;
@@ -1377,6 +1937,8 @@ sub estimate_cost
 	$cost_details{'EXCEPTION'} += $n;
 	$n = () = $str =~ m/REGEXP_LIKE/igs;
 	$cost_details{'REGEXP_LIKE'} += $n;
+	$n = () = $str =~ m/REGEXP_SUBSTR/igs;
+	$cost_details{'REGEXP_SUBSTR'} += $n;
 	$n = () = $str =~ m/\b(INSERTING|DELETING|UPDATING)\b/igs;
 	$cost_details{'TG_OP'} += $n;
 	$n = () = $str =~ m/CURSOR/igs;
@@ -1387,9 +1949,9 @@ sub estimate_cost
 	$cost_details{'SAVEPOINT'} += $n;
 	$n = () = $str =~ m/(FROM|EXEC)((?!WHERE).)*\b[\w\_]+\@[\w\_]+\b/igs;
 	$cost_details{'DBLINK'} += $n;
-	$n = () = $str =~ m/%ISOPEN\b/igs;
+	$n = () = $str =~ m/\%ISOPEN\b/igs;
 	$cost_details{'ISOPEN'} += $n;
-	$n = () = $str =~ m/%ROWCOUNT\b/igs;
+	$n = () = $str =~ m/\%ROWCOUNT\b/igs;
 	$cost_details{'ROWCOUNT'} += $n;
 
 	$n = () = $str =~ m/PLVDATE/igs;
@@ -1435,6 +1997,8 @@ sub estimate_cost
 	$cost_details{'TO_CHAR'} += $n;
 	$n = () = $str =~ m/\s+ANYDATA/igs;
 	$cost_details{'ANYDATA'} += $n;
+	$n = () = $str =~ m/\|\|/igs;
+	$cost_details{'CONCAT'} += $n;
 
 
 	foreach my $f (@ORA_FUNCTIONS) {
@@ -1460,18 +2024,32 @@ sub mysql_to_plpgsql
 {
         my ($class, $str) = @_;
 
-	#--------------------------------------------
+	# remove FROM DUAL
+	$str =~ s/FROM\s+DUAL//igs;
+
 	# Procedure are functions returning void
 	$str =~ s/\bPROCEDURE\b/FUNCTION/igs;
 
 	# Simply remove this as not supported
 	$str =~ s/\bDEFAULT\s+NULL\b//igs;
 
-	# Change mysql varaible affectation 
-	$str =~ s/\bSET\s+([^\s]+\s*)=([^;\n]+;)/$1:=$2/igs;
+	# Change mysql variable affectation 
+	$str =~ s/\bSET\s+([^\s:=]+\s*)=([^;\n]+;)/$1:=$2/igs;
 
 	# remove declared handler
 	$str =~ s/[^\s]+\s+HANDLER\s+FOR\s+[^;]+;//igs;
+
+	# Fix call to unsigned
+	$str =~ s/UNSIGNED\sINTEGER/bigint/g;
+	$str =~ s/UNSIGNED\sINT/bigint/g;
+	$str =~ s/UNSIGNED/bigint/g;
+
+	# Drop temporary doesn't exist in PostgreSQL
+	$str =~ s/DROP\s+TEMPORARY/DROP/gs;
+
+	# Remove extra parenthesis in join in some possible cases
+	# ... INNER JOIN(services s) ON ...
+	$str =~ s/\bJOIN\s*\(([^\s]+\s+[^\s]+)\)/JOIN $1/igs;
 
 	# Try to replace LEAVE label by EXIT label
 	my %repl_leave = ();
@@ -1507,6 +2085,8 @@ sub mysql_to_plpgsql
 	# Replace now() with CURRENT_TIMESTAMP even if this is the same
 	# because parenthesis can break the following regular expressions
 	$str =~ s/\bNOW\(\s*\)/CURRENT_TIMESTAMP/igs;
+	# Replace call to CURRENT_TIMESTAMP() to special variable
+	$str =~ s/\bCURRENT_TIMESTAMP\s*\(\)/CURRENT_TIMESTAMP/igs;
 
 	# Replace EXTRACT() with unit not supported by PostgreSQL
 	if ($class->{mysql_internal_extract_format}) {
@@ -1581,13 +2161,14 @@ sub mysql_to_plpgsql
 	$str =~ s/\bUTC_TIME\(\s*\)/(CURRENT_TIMESTAMP AT TIME ZONE 'UTC')::time(0)/igs;
 	$str =~ s/\bUTC_TIMESTAMP\(\s*\)/(CURRENT_TIMESTAMP AT TIME ZONE 'UTC')::timestamp(0)/igs;
 
-	# Replace some function with different name and format
-	$str =~ s/\b(ADDDATE|DATE_ADD)\(\s*([^,]+)\s*,\s*INTERVAL ([^\(\),]+)\s*\)/($2)::timestamp + interval '$3'/igs;
-	$str =~ s/\bADDDATE\(\s*([^,]+)\s*,\s*(\d+)\s*\)/($1)::timestamp + ($2 * interval '1 day')/igs;
-	$str =~ s/\bADDTIME\(\s*([^,]+)\s*,\s*([^\(\)]+)\s*\)/($1)::timestamp + ($2)::interval/igs;
 	$str =~ s/\bCONVERT_TZ\(\s*([^,]+)\s*,\s*([^,]+)\s*,\s*([^\(\),]+)\s*\)/(($1)::timestamp without time zone AT TIME ZONE ($2)::text) AT TIME ZONE ($3)::text/igs;
 	$str =~ s/\bDATEDIFF\(\s*([^,]+)\s*,\s*([^\(\)]+)\s*\)/extract(day from (date_trunc('day', ($1)::timestamp) - date_trunc('day', ($2)::timestamp)))/igs;
-	$str =~ s/\bDATE_FORMAT\(\s*(.*?)\s*,\s*('[^\(\)]+')\s*\)/_mysql_dateformat_to_pgsql($1, $2)/eigs;
+	$str =~ s/\bDATE_FORMAT\(\s*(.*?)\s*,\s*('[^'\(\)]+'|\?TEXTVALUE\d+\?)\s*\)/_mysql_dateformat_to_pgsql($class, $1, $2)/iges;
+	$str =~ s/\b(?:ADDDATE|DATE_ADD)\(\s*(.*?)\s*,\s*INTERVAL\s*([^\(\),]+)\s*\)/"($1)::timestamp " . _replace_dateadd($2)/iges;
+	$str =~ s/\bADDDATE\(\s*([^,]+)\s*,\s*(\d+)\s*\)/($1)::timestamp + ($2 * interval '1 day')/igs;
+	$str =~ s/\bADDTIME\(\s*([^,]+)\s*,\s*([^\(\)]+)\s*\)/($1)::timestamp + ($2)::interval/igs;
+
+
 	$str =~ s/\b(DAY|DAYOFMONTH)\(\s*([^\(\)]+)\s*\)/extract(day from date($1))::integer/igs;
 	$str =~ s/\bDAYNAME\(\s*([^\(\)]+)\s*\)/to_char(($1)::date, 'FMDay')/igs;
 	$str =~ s/\bDAYOFWEEK\(\s*([^\(\)]+)\s*\)/extract(dow from date($1))::integer + 1/igs; # start on sunday = 1
@@ -1595,8 +2176,8 @@ sub mysql_to_plpgsql
 	$str =~ s/\bFORMAT\(\s*([^,]+)\s*,\s*([^\(\)]+)\s*\)/to_char(round($1, $2), 'FM999,999,999,999,999,999,990'||case when $2 > 0 then '.'||repeat('0', $2) else '' end)/igs;
 	$str =~ s/\bFROM_DAYS\(\s*([^\(\)]+)\s*\)/'0001-01-01bc'::date + ($1)::integer/igs;
 	$str =~ s/\bFROM_UNIXTIME\(\s*([^\(\),]+)\s*\)/to_timestamp($1)::timestamp without time zone/igs;
-	$str =~ s/\bFROM_UNIXTIME\(\s*(.*?)\s*,\s*('[^\(\)]+')\s*\)/FROM_UNIXTIME2(to_timestamp($1), $2)/igs;
-	$str =~ s/\bFROM_UNIXTIME2\(\s*(.*?)\s*,\s*('[^\)]+')\s*\)/_mysql_dateformat_to_pgsql($1, $2)/eigs;
+	$str =~ s/\bFROM_UNIXTIME\(\s*(.*?)\s*,\s*('[^\(\)]+'|\?TEXTVALUE\d+\?)\s*\)/FROM_UNIXTIME2(to_timestamp($1), $2)/igs;
+	$str =~ s/\bFROM_UNIXTIME2\(\s*(.*?)\s*,\s*('[^'\(\)]+'|\?TEXTVALUE\d+\?)\s*\)/_mysql_dateformat_to_pgsql($class, $1, $2)/eigs;
 	$str =~ s/\bGET_FORMAT\(\s*([^,]+)\s*,\s*([^\(\)]+)\s*\)/_mysql_getformat_to_pgsql($1, $2)/eigs;
 	$str =~ s/\bHOUR\(\s*([^\(\)]+)\s*\)/extract(hour from ($1)::interval)::integer/igs;
 	$str =~ s/\bLAST_DAY\(\s*([^\(\)]+)\s*\)/(date_trunc('month',($1)::timestamp + interval '1 month'))::date - 1/igs;
@@ -1609,7 +2190,7 @@ sub mysql_to_plpgsql
 	$str =~ s/\bQUARTER\(\s*([^\(\)]+)\s*\)/extract(quarter from date($1))::integer/igs;
 	$str =~ s/\bSECOND\(\s*([^\(\)]+)\s*\)/extract(second from ($1)::interval)::integer/igs;
 	$str =~ s/\bSEC_TO_TIME\(\s*([^\(\)]+)\s*\)/($1 * interval '1 second')/igs;
-	$str =~ s/\bSTR_TO_DATE\(\s*(.*?)\s*,\s*('[^\(\),]+')\s*\)/_mysql_strtodate_to_pgsql($1, $2)/eigs;
+	$str =~ s/\bSTR_TO_DATE\(\s*(.*?)\s*,\s*('[^'\(\),]+'|\?TEXTVALUE\d+\?)\s*\)/_mysql_strtodate_to_pgsql($class, $1, $2)/eigs;
 	$str =~ s/\b(SUBDATE|DATE_SUB)\(\s*([^,]+)\s*,\s*INTERVAL ([^\(\)]+)\s*\)/($2)::timestamp - interval '$3'/igs;
 	$str =~ s/\bSUBDATE\(\s*([^,]+)\s*,\s*(\d+)\s*\)/($1)::timestamp - ($2 * interval '1 day')/igs;
 	$str =~ s/\bSUBTIME\(\s*([^,]+)\s*,\s*([^\(\)]+)\s*\)/($1)::timestamp - ($2)::interval/igs;
@@ -1625,7 +2206,7 @@ sub mysql_to_plpgsql
 	$str =~ s/\bTIMESTAMPDIFF\(\s*HOUR\s*,\s*([^,]+)\s*,\s*([^\(\),]+)\s*\)/floor(extract(epoch from ( ($2)::timestamp - ($1)::timestamp))\/3600)/igs;
 	$str =~ s/\bTIMESTAMPDIFF\(\s*MINUTE\s*,\s*([^,]+)\s*,\s*([^\(\),]+)\s*\)/floor(extract(epoch from ( ($2)::timestamp - ($1)::timestamp))\/60)/igs;
 	$str =~ s/\bTIMESTAMPDIFF\(\s*SECOND\s*,\s*([^,]+)\s*,\s*([^\(\),]+)\s*\)/extract(epoch from ($2)::timestamp) - extract(epoch from ($1)::timestamp))/igs;
-	$str =~ s/\bTIME_FORMAT\(\s*(.*?)\s*,\s*('[^\(\),]+')\s*\)/_mysql_timeformat_to_pgsql($1, $2)/eigs;
+	$str =~ s/\bTIME_FORMAT\(\s*(.*?)\s*,\s*('[^'\(\),]+'|\?TEXTVALUE\d+\?)\s*\)/_mysql_timeformat_to_pgsql($class, $1, $2)/eigs;
 	$str =~ s/\bTIME_TO_SEC\(\s*([^\(\)]+)\s*\)/(extract(hours from ($1)::time)*3600 + extract(minutes from ($1)::time)*60 + extract(seconds from ($1)::time))::bigint/igs;
 	$str =~ s/\bTO_DAYS\(\s*([^\(\)]+)\s*\)/(($1)::date - '0001-01-01bc')::integer/igs;
 	$str =~ s/\bWEEK(\([^\(\)]+\))/extract(week from date($1)) - 1/igs;
@@ -1644,10 +2225,15 @@ sub mysql_to_plpgsql
 	$str =~ s/\bFROM_BASE64\(\s*([^\(\),]+)\s*\)/decode(($1)::bytea, 'base64')/igs;
 	$str =~ s/\bHEX\(\s*([^\(\),]+)\s*\)/upper(encode($1::bytea, 'hex'))/igs;
 	$str =~ s/\bINSTR\s*\(\s*([^,]+),\s*('[^']+')\s*\)/position($2 in $1)/igs;
-	$str =~ s/\bLOCATE\(\s*([^\(\),]+)\s*,\s*([^\(\),]+)\s*,\s*([^\(\),]+)\s*\)/position($1 in substr($2, $3)) + $3 - 1/igs;
+	if (!$class->{pg_supports_substr}) {
+		$str =~ s/\bLOCATE\(\s*([^\(\),]+)\s*,\s*([^\(\),]+)\s*,\s*([^\(\),]+)\s*\)/position($1 in substring ($2 from $3)) + $3 - 1/igs;
+		$str =~ s/\bMID\(/substring\(/igs;
+	} else {
+		$str =~ s/\bLOCATE\(\s*([^\(\),]+)\s*,\s*([^\(\),]+)\s*,\s*([^\(\),]+)\s*\)/position($1 in substr($2, $3)) + $3 - 1/igs;
+		$str =~ s/\bMID\(/substr\(/igs;
+	}
 	$str =~ s/\bLOCATE\(\s*([^\(\),]+)\s*,\s*([^\(\),]+)\s*\)/position($1 in $2)/igs;
 	$str =~ s/\bLCASE\(/lower\(/igs;
-	$str =~ s/\bMID\(/substr\(/igs;
 	$str =~ s/\bORD\(/ascii\(/igs;
 	$str =~ s/\bQUOTE\(/quote_literal\(/igs;
 	$str =~ s/\bSPACE\(\s*([^\(\),]+)\s*\)/repeat(' ', $1)/igs;
@@ -1672,17 +2258,19 @@ sub mysql_to_plpgsql
 	$str =~ s/\bRELEASE_LOCK/pg_advisory_unlock/igs;
 
 	# GROUP_CONCAT doesn't exist, it must be replaced by calls to array_to_string() and array_agg() functions
-	$str =~ s/GROUP_CONCAT\((.*?)\s+ORDER\s+BY\s+([^\s]+)\s+(ASC|DESC)\s+SEPARATOR\s+'([^']+)'\s*\)/array_to_string(array_agg($1 ORDER BY $2 $3), '$4')/igs;
-	$str =~ s/GROUP_CONCAT\((.*?)\s+ORDER\s+BY\s+([^\s]+)\s+SEPARATOR\s+'([^']+)'\s*\)/array_to_string(array_agg($1 ORDER BY $2 ASC), '$3')/igs;
-	$str =~ s/GROUP_CONCAT\((.*?)\s+SEPARATOR\s+'([^']+)'\s*\)/array_to_string(array_agg($1), '$2')/igs;
+	$str =~ s/GROUP_CONCAT\((.*?)\s+ORDER\s+BY\s+([^\s]+)\s+(ASC|DESC)\s+SEPARATOR\s+(\?TEXTVALUE\d+\?|'[^']+')\s*\)/array_to_string(array_agg($1 ORDER BY $2 $3), $4)/igs;
+	$str =~ s/GROUP_CONCAT\((.*?)\s+ORDER\s+BY\s+([^\s]+)\s+SEPARATOR\s+(\?TEXTVALUE\d+\?|'[^']+')\s*\)/array_to_string(array_agg($1 ORDER BY $2 ASC), $3)/igs;
+	$str =~ s/GROUP_CONCAT\((.*?)\s+SEPARATOR\s+(\?TEXTVALUE\d+\?|'[^']+')\s*\)/array_to_string(array_agg($1), $2)/igs;
+	$str =~ s/GROUP_CONCAT\((.*?)\s+ORDER\s+BY\s+([^\s]+)\s+(ASC|DESC)\s*\)/array_to_string(array_agg($1 ORDER BY $2 $3), ',')/igs;
+	$str =~ s/GROUP_CONCAT\((.*?)\s+ORDER\s+BY\s+([^\s]+)\s*\)/array_to_string(array_agg($1 ORDER BY $2), ',')/igs;
+	$str =~ s/GROUP_CONCAT\(([^\)]+)\)/array_to_string(array_agg($1), ',')/igs;
 
-	# Replace IF() function in a query
-	$str =~ s/\bIF\(\s*([^,]+)\s*,\s*([^,]+)\s*,\s*([^\)]+\s*)\)/(CASE WHEN $1 THEN $2 ELSE $3 END)/igs;
-	$str =~ s/\bIFNULL\(\s*([^,]+)\s*,\s*([^\)]+\s*)\)/COALESCE($1, $2)/igs;
+	# Replace IFNULL() MySQL function in a query
+	while ($str =~ s/\bIFNULL\(\s*([^,]+)\s*,\s*([^\)]+\s*)\)/COALESCE($1, $2)/is) {};
 
 	# Rewrite while loop
-	$str =~ s/\bWHILE\s+(.*?)\bEND WHILE\s*;/WHILE $1END LOOP;/igs;
-	$str =~ s/\bWHILE\s+(.*?)DO\b/WHILE $1LOOP/igs;
+	$str =~ s/\bWHILE\b(.*?)\bEND\s+WHILE\s*;/WHILE $1END LOOP;/igs;
+	$str =~ s/\bWHILE\b(.*?)\bDO\b/WHILE $1LOOP/igs;
 
 	# Rewrite REPEAT loop
 	my %repl_repeat = ();
@@ -1697,11 +2285,65 @@ sub mysql_to_plpgsql
 	}
 	%repl_repeat = ();
 
+	# Fix some charset encoding call in cast function
+	#$str =~ s/(CAST\s*\((?:.*?)\s+AS\s+(?:[^\s]+)\s+)CHARSET\s+([^\s\)]+)\)/$1) COLLATE "\U$2\E"/igs;
+	$str =~ s/(CAST\s*\((?:.*?)\s+AS\s+(?:[^\s]+)\s+)(CHARSET|CHARACTER\s+SET)\s+([^\s\)]+)\)/$1)/igs;
+	$str =~ s/CONVERT\s*(\((?:[^,]+)\s+,\s+(?:[^\s]+)\s+)(CHARSET|CHARACTER\s+SET)\s+([^\s\)]+)\)/CAST$1)/igs;
+	$str =~ s/CONVERT\s*\((.*?)\s+USING\s+([^\s\)]+)\)/CAST($1 AS text)/igs;
+	# Set default UTF8 collation to postgreSQL equivalent C.UTF-8
+	#$str =~ s/COLLATE "UTF8"/COLLATE "C.UTF-8"/gs;
+	$str =~ s/\bCHARSET(\s+)/COLLATE$1/igs;
+
+	# Remove call to start transaction
+	$str =~ s/\sSTART\s+TRANSACTION\s*;/-- START TRANSACTION;/igs;
+
+	# Comment call to COMMIT or ROLLBACK in the code if allowed
+	if ($class->{comment_commit_rollback}) {
+		$str =~ s/\b(COMMIT|ROLLBACK)\s*;/-- $1;/igs;
+		$str =~ s/(ROLLBACK\s+TO\s+[^;]+);/-- $1;/igs;
+	}
+
+	# Translate call to CREATE TABLE ... SELECT
+	$str =~ s/(CREATE(?:\s+TEMPORARY)?\s+TABLE\s+[^\s]+)(\s+SELECT)/$1 AS $2/igs;
+
+	# Remove @ from variables and rewrite SET assignement in QUERY mode
+	if ($class->{type} eq 'QUERY') {
+		$str =~ s/\@([^\s]+)\b/$1/gs;
+		$str =~ s/:=/=/gs;
+	}
+
 	# Replace spatial related lines
 	$str = replace_mysql_spatial($str);
 
+	# Rewrite direct call to function without out parameters using PERFORM
+	$str = perform_replacement($class, $str);
+
+	# Remove CALL from all statement
+	$str =~ s/\bCALL\s+/$1/igs;
+
 	return $str;
 }
+
+sub _replace_dateadd
+{
+	my $str = shift;
+	my $dd = shift;
+
+	my $op = '+';
+	if ($str =~ s/^\-[\s]*//) {
+		$op = '-';
+	}
+	if ($str =~ s/^(\d+)\s+([^\(\),\s]+)$/ $op $1*interval '1 $2'/s) {
+		return $str;
+	} elsif ($str =~ s/^([^\s]+)\s+([^\(\),\s]+)$/ $op $1*interval '1 $2'/s) {
+		return $str;
+	} elsif ($str =~ s/^([^\(\),]+)$/ $op interval '$1'/s) {
+		return $str;
+	}
+
+	return $str;
+}
+
 
 sub replace_mysql_spatial
 {
@@ -1785,18 +2427,18 @@ sub _mysql_getformat_to_pgsql
 
 sub _mysql_strtodate_to_pgsql
 {
-	my ($datetime, $format) = @_;
+	my ($class, $datetime, $format) = @_;
 
-	my $str = _mysql_dateformat_to_pgsql($datetime, $format, 1);
+	my $str = _mysql_dateformat_to_pgsql($class, $datetime, $format, 1);
 
 	return $str;
 }
 
 sub _mysql_timeformat_to_pgsql
 {
-	my ($datetime, $format) = @_;
+	my ($class, $datetime, $format) = @_;
 
-	my $str = _mysql_dateformat_to_pgsql($datetime, $format, 0, 1);
+	my $str = _mysql_dateformat_to_pgsql($class, $datetime, $format, 0, 1);
 
 	return $str;
 }
@@ -1804,15 +2446,18 @@ sub _mysql_timeformat_to_pgsql
 
 sub _mysql_dateformat_to_pgsql
 {
-	my ($datetime, $format, $todate, $totime) = @_;
+	my ($class, $datetime, $format, $todate, $totime) = @_;
 
 # Not supported:
 # %X	Year for the week where Sunday is the first day of the week, numeric, four digits; used with %V
 
+	if ($format =~ s/\?TEXTVALUE(\d+)\?/$class->{text_values}{$1}/) {
+		delete $class->{text_values}{$1};
+	}
+
 	$format =~ s/\%a/Dy/g;
 	$format =~ s/\%b/Mon/g;
 	$format =~ s/\%c/FMMM/g;
-	$format =~ s/\%d/DD/g;
 	$format =~ s/\%D/FMDDth/g;
 	$format =~ s/\%e/FMDD/g;
 	$format =~ s/\%f/US/g;
@@ -1839,6 +2484,13 @@ sub _mysql_dateformat_to_pgsql
 	$format =~ s/\%y/YY/g;
 	$format =~ s/\%W/Day/g;
 	$format =~ s/\%M/Month/g;
+	$format =~ s/\%(\d+)/$1/g;
+
+	# Replace constant strings
+	if ($format =~ s/('[^']+')/\?TEXTVALUE$class->{text_values_pos}\?/s) {
+		$class->{text_values}{$class->{text_values_pos}} = $1;
+		$class->{text_values_pos}++;
+	}
 
 	if ($todate) {
 		return "to_date($datetime, $format)";
@@ -1907,31 +2559,32 @@ sub mysql_estimate_cost
 
 sub replace_outer_join
 {
-	my ($str, $type) = @_;
+	my ($class, $str, $type) = @_;
 
 	if (!grep(/^$type$/, 'left', 'right')) {
 		die "FATAL: outer join type must be 'left' or 'right' in call to replace_outer_join().\n";
 	}
 
-	my $regexp1 = qr/(\%OUTERJOIN\%\s*(?:!=|<>|>=|<=|=|>|<|NOT LIKE|LIKE))/is;
-	my $regexp2 = qr/(?:!=|<>|>=|<=|=|>|<|NOT LIKE|LIKE)\s*[^\s]+\s*\%OUTERJOIN\%/is;
-
-	if ($type eq 'left') {
-		$regexp1 = qr/((?:!=|<>|>=|<=|=|>|<|NOT LIKE|LIKE)\s*[^\s]+\s*\%OUTERJOIN\%)/is;
-		$regexp2 = qr/\%OUTERJOIN\%\s*(?:!=|<>|>=|<=|=|>|<|NOT LIKE|LIKE)/is;
+	# When we have a right outer join, just rewrite it as a left join to simplify the translation work
+	if ($type eq 'right') {
+		$str =~ s/(\s+)([^\s]+)\s*(\%OUTERJOIN\d+\%)\s*(!=|<>|>=|<=|=|>|<|NOT LIKE|LIKE)\s*([^\s]+)/$1$5 $4 $2$3/isg;
+		return $str;
 	}
+
+	my $regexp1 = qr/((?:!=|<>|>=|<=|=|>|<|NOT LIKE|LIKE)\s*[^\s]+\s*\%OUTERJOIN\d+\%)/is;
+	my $regexp2 = qr/\%OUTERJOIN\d+\%\s*(?:!=|<>|>=|<=|=|>|<|NOT LIKE|LIKE)/is;
 
 	# process simple form of outer join
 	my $nbouter = $str =~ $regexp1;
 
 	# Check that we don't have right outer join too
 	if ($nbouter >= 1 && $str !~ $regexp2) {
-
-		# Extract the FROM clause
+		# Extract tables in the FROM clause
 		$str =~ s/(.*)\bFROM\s+(.*?)\s+WHERE\s+(.*?)$/$1FROM FROM_CLAUSE WHERE $3/is;
 		my $from_clause = $2;
 		$from_clause =~ s/"//gs;
 		my @tables = split(/\s*,\s*/, $from_clause);
+
 		# Set a hash for alias to table mapping
 		my %from_clause_list = ();
 		my %from_order = ();
@@ -1944,7 +2597,7 @@ sub replace_outer_join
 				$cmt .= $1;
 			}
 			my ($t, $alias, @others) = split(/\s+/, lc($table));
-			$alias = "$cmt$t" if (!$alias);
+			$alias = "$t" if (!$alias);
 			$from_clause_list{$alias} = "$cmt$t";
 			$from_order{$alias} = $fidx++;
 		}
@@ -1959,52 +2612,107 @@ sub replace_outer_join
 		if ($str =~ s/^(.*FROM FROM_CLAUSE WHERE)//is) {
 			$start_query = $1;
 		}
-		if ($str =~ s/\s+((?:GROUP BY|ORDER BY).*)$//is) {
+		if ($str =~ s/\s+((?:START WITH|CONNECT BY|ORDER SIBLINGS BY|GROUP BY|ORDER BY).*)$//is) {
 			$end_query = $1;
 		}
+
+		# Extract predicat from the WHERE clause
 		my @predicat = split(/\s*(\bAND\b|\bOR\b|\%ORA2PG_COMMENT\d+\%)\s*/i, $str);
 		my $id = 0;
+		my %other_join_clause = ();
 		# Process only predicat with a obsolete join syntax (+) for now
 		for (my $i = 0; $i <= $#predicat; $i++) {
-			next if ($predicat[$i] !~ /\%OUTERJOIN\%/i);
-			$predicat[$i] =~ s/(.*)/WHERE_CLAUSE$id /is;
-			my $where_clause = $1;
+			next if ($predicat[$i] !~ /\%OUTERJOIN\d+\%/i);
+			my $where_clause = $predicat[$i];
 			$where_clause =~ s/"//gs;
 			$where_clause =~ s/^\s+//s;
 			$where_clause =~ s/[\s;]+$//s;
-			$where_clause =~ s/\s*\%OUTERJOIN\%//gs;
+			$where_clause =~ s/\s*(\%OUTERJOIN\d+\%)//gs;
+
+			$predicat[$i] = "WHERE_CLAUSE$id ";
 
 			# Split the predicat to retrieve left part, operator and right part
-			my ($l, $o, $r) = split(/\s*(=|LIKE)\s*/i, $where_clause);
+			my ($l, $o, $r) = split(/\s*(!=|>=|<=|=|<>|<|>|NOT LIKE|LIKE)\s*/i, $where_clause);
 
-			# When the part of the clause are not single fields move them
-			# at their places in the WHERE clause and go to next predicat
-			if (($l !~ /^[^\.]+\.[^\s]+$/s) || ($r !~ /^[^\.]+\.[^\s]+$/s)) {
+			# NEW / OLD pseudo table in triggers can not be part of a join
+			# clause. Move them int to the WHERE clause.
+			if ($l =~ /^(NEW|OLD)\./is) {
 				$predicat[$i] =~ s/WHERE_CLAUSE$id / $l $o $r /s;
 				next;
 			}
 			$id++;
+
 			# Extract the tablename part of the left clause
 			my $lbl1 = '';
 			my $table_decl1 = $l;
 			if ($l =~ /^([^\.]+)\..*/) {
 				$lbl1 = lc($1);
+				# If the table/alias is not part of the from clause
+				if (!exists $from_clause_list{$lbl1}) {
+					$from_clause_list{$lbl1} = $lbl1;
+					$from_order{$lbl1} = $fidx++;
+				}
 				$table_decl1 = $from_clause_list{$lbl1};
 				$table_decl1 .= " $lbl1" if ($lbl1 ne $from_clause_list{$lbl1});
+			} elsif ($l =~ /\%SUBQUERY(\d+)\%/) {
+				# Search for table.column in the subquery or function code
+				my $tmp_str = $l;
+				while ($tmp_str =~ s/\%SUBQUERY(\d+)\%/$class->{sub_parts}{$1}/is) {
+					if ($tmp_str =~ /\b(\w+)\.\w+/) {
+						$lbl1 = lc($1);
+						# If the table/alias is not part of the from clause
+						if (!exists $from_clause_list{$lbl1}) {
+							$from_clause_list{$lbl1} = $lbl1;
+							$from_order{$lbl1} = $fidx++;
+						}
+						$table_decl1 = $from_clause_list{$lbl1};
+						$table_decl1 .= " $lbl1" if ($lbl1 ne $from_clause_list{$lbl1});
+						last;
+					}
+				}
 			}
 			# Extract the tablename part of the right clause
 			my $lbl2 = '';
 			my $table_decl2 = $r;
 			if ($r =~ /^([^\.]+)\..*/) {
 				$lbl2 = lc($1);
+				if (!$lbl1) {
+					push(@{$other_join_clause{$lbl2}}, "$l $o $r");
+					next;
+				}
+				# If the table/alias is not part of the from clause
+				if (!exists $from_clause_list{$lbl2}) {
+					$from_clause_list{$lbl2} = $lbl2;
+					$from_order{$lbl2} = $fidx++;
+				}
 				$table_decl2 = $from_clause_list{$lbl2};
-				$table_decl2 .= " $lbl2" if ($lbl2 ne $from_clause_list{$1});
+				$table_decl2 .= " $lbl2" if ($lbl2 ne $from_clause_list{$lbl2});
+			} elsif ($lbl1) {
+				# Search for table.column in the subquery or function code
+				my $tmp_str = $r;
+				while ($tmp_str =~ s/\%SUBQUERY(\d+)\%/$class->{sub_parts}{$1}/is) {
+					if ($tmp_str =~ /\b(\w+)\.\w+/) {
+						$lbl2 = lc($1);
+						# If the table/alias is not part of the from clause
+						if (!exists $from_clause_list{$lbl2}) {
+							$from_clause_list{$lbl2} = $lbl2;
+							$from_order{$lbl2} = $fidx++;
+						}
+						$table_decl2 = $from_clause_list{$lbl2};
+						$table_decl2 .= " $lbl2" if ($lbl2 ne $from_clause_list{$lbl2});
+					}
+				}
+				if (!$lbl2 ) {
+					push(@{$other_join_clause{$lbl1}}, "$l $o $r");
+					next;
+				}
 			}
 
 			# When this is the first join parse add the left tablename
 			# first then the outer join with the right table
 			if (scalar keys %final_from_clause == 0) {
 				$from_clause = $table_decl1;
+				$table_decl1 =~ s/\s*\%ORA2PG_COMMENT\d+\%\s*//igs;
 				push(@outer_clauses, (split(/\s/, $table_decl1))[1] || $table_decl1);
 				$final_from_clause{"$lbl1;$lbl2"}{position} = $i;
 				push(@{$final_from_clause{"$lbl1;$lbl2"}{clause}{$table_decl2}{predicat}}, "$l $o $r");
@@ -2034,15 +2742,16 @@ sub replace_outer_join
 		foreach my $t (sort { $final_from_clause{$a}{position} <=> $final_from_clause{$b}{position} } keys %final_from_clause) {
 			foreach my $j (sort { $final_from_clause{$t}{clause}{$a}{position} <=> $final_from_clause{$t}{clause}{$b}{position} } keys %{$final_from_clause{$t}{clause}}) {
 				next if ($#{$final_from_clause{$t}{clause}{$j}{predicat}} < 0);
-				if ($j !~ /\(\%SUBQUERY\d+\%\)/i && $from_clause !~ /\b\Q$final_from_clause{$t}{clause}{$j}{$type}\E\b/) {
+
+				if (exists $final_from_clause{$t}{clause}{$j}{$type} && $j !~ /\%SUBQUERY\d+\%/i && $from_clause !~ /\b\Q$final_from_clause{$t}{clause}{$j}{$type}\E\b/) {
 					$from_clause .= ",$final_from_clause{$t}{clause}{$j}{$type}";
 					push(@outer_clauses, (split(/\s/, $final_from_clause{$t}{clause}{$j}{$type}))[1] || $final_from_clause{$t}{clause}{$j}{$type});
 				}
+				my ($l,$r) = split(/;/, $t);
 				my $tbl = $j;
 				$tbl =~ s/\s*\%ORA2PG_COMMENT\d+\%\s*//isg;
 				$from_clause .= "\n\U$type\E OUTER JOIN $tbl ON (" .  join(' AND ', @{$final_from_clause{$t}{clause}{$j}{predicat}}) . ")";
-				my ($l,$r) = split(/;/, $t);
-				push(@{$final_outer_clauses{$l}{join}},  "\U$type\E OUTER JOIN $tbl ON (" .  join(' AND ', @{$final_from_clause{$t}{clause}{$j}{predicat}}) . ")");
+				push(@{$final_outer_clauses{$l}{join}},  "\U$type\E OUTER JOIN $tbl ON (" .  join(' AND ', @{$final_from_clause{$t}{clause}{$j}{predicat}}, @{$other_join_clause{$r}}) . ")");
 				push(@{$final_outer_clauses{$l}{position}},  $final_from_clause{$t}{clause}{$j}{position});
 				push(@{$associated_clause{$l}}, $r);
 			}
@@ -2051,8 +2760,7 @@ sub replace_outer_join
 		$from_clause = '';
 		my @clause_done = ();
 		foreach my $c (sort { $from_order{$a} <=> $from_order{$b} } keys %from_order) {
-			next if (!grep(/^$c$/i, @outer_clauses));
-
+			next if (!grep(/^\Q$c\E$/i, @outer_clauses));
 			my @output = ();
 			for (my $j = 0; $j <= $#{$final_outer_clauses{$c}{join}}; $j++) {
 				push(@output, $final_outer_clauses{$c}{join}[$j]);
@@ -2060,7 +2768,7 @@ sub replace_outer_join
 
 			find_associated_clauses($c, \@output, \%associated_clause, \%final_outer_clauses);
 
-			if (!grep(/JOIN $from_clause_list{$c} $c /is, @clause_done)) {
+			if (!grep(/\QJOIN $from_clause_list{$c} $c \E/is, @clause_done)) {
 				$from_clause .= "\n, $from_clause_list{$c}";
 				$from_clause .= " $c" if ($c ne $from_clause_list{$c});
 			}
@@ -2075,7 +2783,7 @@ sub replace_outer_join
 		$from_clause =~ s/^\s*,\s*//s;
 
 		# Append tables to from clause that was not involved into an outer join
-		foreach my $a (keys %from_clause_list) {
+		foreach my $a (sort keys %from_clause_list) {
 			my $table_decl = "$from_clause_list{$a}";
 			$table_decl .= " $a" if ($a ne $from_clause_list{$a});
 			# Remove comment before searching it inside the from clause
@@ -2084,13 +2792,15 @@ sub replace_outer_join
 			while ($tmp_tbl =~ s/(\s*\%ORA2PG_COMMENT\d+\%\s*)//is) {
 				$comment .= $1;
 			}
-			if ($table_decl !~ /\(\%SUBQUERY\d+\%\)/i && $from_clause !~ /\b\Q$tmp_tbl\E\b/) {
+
+			if ($from_clause !~ /(^|\s|,)\Q$tmp_tbl\E\b/is) {
 				$from_clause = "$table_decl, " . $from_clause;
 			} elsif ($comment) {
 				 $from_clause = "$comment " . $from_clause;
 			}
 		}
-
+		$from_clause =~ s/\b(new|old)\b/\U$1\E/gs;
+		$from_clause =~ s/,\s*$/ /s;
 		$str =~ s/FROM FROM_CLAUSE/FROM $from_clause/s;
 	}
 
@@ -2111,6 +2821,282 @@ sub find_associated_clauses
 	delete $associated_clause->{$c};
 }
 
+
+sub replace_connect_by
+{
+	my ($class, $str) = @_;
+
+	return $str if ($str !~ /\bCONNECT\s+BY\b/is);
+
+	my $final_query = "WITH RECURSIVE cte AS (\n";
+
+	# Remove NOCYCLE, not supported at now
+	$str =~ s/\s+NOCYCLE//is;
+
+	# Remove SIBLINGS keywords and enable siblings rewrite 
+	my $siblings = 0;
+	if ($str =~ s/\s+SIBLINGS//is) {
+		$siblings = 1;
+	}
+
+	# Extract UNION part of the query to past it at end
+	my $union = '';
+	if ($str =~ s/(CONNECT BY.*)(\s+UNION\s+.*)/$1/is) {
+		$union = $2;
+	}
+	
+	# Extract order by to past it to the query at end
+	my $order_by = '';
+	if ($str =~ s/\s+ORDER BY(.*)//is) {
+		$order_by = $1;
+	}
+
+	# Extract group by to past it to the query at end
+	my $group_by = '';
+	if ($str =~ s/(\s+GROUP BY.*)//is) {
+		$group_by = $1;
+	}
+
+	# Extract the starting node or level of the tree 
+	my $where_clause = '';
+	my $start_with = '';
+	if ($str =~ s/WHERE\s+(.*?)\s+START\s+WITH\s*(.*?)\s+CONNECT BY\s*//is) {
+		$where_clause = " WHERE $1";
+		$start_with = $2;
+	} elsif ($str =~ s/WHERE\s+(.*?)\s+CONNECT BY\s+(.*?)\s+START\s+WITH\s*(.*)/$2/is) {
+		$where_clause = " WHERE $1";
+		$start_with = $3;
+	} elsif ($str =~ s/START\s+WITH\s*(.*?)\s+CONNECT BY\s*//is) {
+		$start_with = $1;
+	} elsif ($str =~ s/\s+CONNECT BY\s+(.*?)\s+START\s+WITH\s*(.*)/ $1 /is) {
+		$start_with = $2;
+	} else {
+		$str =~ s/CONNECT BY\s*//is;
+	}
+
+	# remove alias from where clause
+	$where_clause =~ s/\b[^\.]\.([^\s]+)\b/$1/gs;
+
+	# Extract the CONNECT BY clause in the hierarchical query
+	my $prior_str = '';
+	my @prior_clause = '';
+	if ($str =~ s/([^\s]+\s*=\s*PRIOR\s+.*)//is) {
+		$prior_str =  $1;
+	} elsif ($str =~ s/(\s*PRIOR\s+.*)//is) {
+		$prior_str =  $1;
+	} else {
+		# look inside subqueries if we have a prior clause
+		my @ids = $str =~ /\%SUBQUERY(\d+)\%/g;
+		my $sub_prior_str = '';
+		foreach my $i (@ids) {
+			if ($class->{sub_parts}{$i} =~ s/([^\s]+\s*=\s*PRIOR\s+.*)//is) {
+				$sub_prior_str =  $1;
+				$str =~ s/\%SUBQUERY$i\%//;
+			} elsif ($class->{sub_parts}{$i} =~ s/(\s*PRIOR\s+.*)//is) {
+				$sub_prior_str =  $1;
+				$str =~ s/\%SUBQUERY$i\%//;
+			}
+			$sub_prior_str =~ s/^\(//;
+			$sub_prior_str =~ s/\)$//;
+			($prior_str ne '' || $sub_prior_str eq '') ? $prior_str .= ' ' . $sub_prior_str : $prior_str = $sub_prior_str;
+		}
+	}
+	if ($prior_str) {
+		# Try to extract the prior clauses
+		my @tmp_prior = split(/\s*AND\s*/, $prior_str);
+		$tmp_prior[-1] =~ s/\s*;\s*//s;
+		my @tmp_prior2 = ();
+		foreach my $p (@tmp_prior) {
+			if ($p =~ /\bPRIOR\b/is) {
+				push(@prior_clause, split(/\s*=\s*/i, $p));
+			} else {
+				$where_clause .= " AND $p";
+			}
+		}
+		if ($siblings) {
+			if ($prior_clause[-1] !~ /PRIOR/i) {
+				$siblings = $prior_clause[-1];
+			} else {
+				$siblings = $prior_clause[-2];
+			}
+			$siblings =~ s/\s+//g;
+		}
+		shift(@prior_clause) if ($prior_clause[0] eq '');
+		my @rebuild_prior = ();
+		# Place PRIOR in the left part if necessary
+		for (my $i = 0; $i < $#prior_clause; $i+=2) {
+			if ($prior_clause[$i+1] =~ /PRIOR\s+/i) {
+				my $tmp = $prior_clause[$i];
+				$prior_clause[$i] = $prior_clause[$i+1];
+				$prior_clause[$i+1] = $tmp;
+			}
+			push(@rebuild_prior, "$prior_clause[$i] = $prior_clause[$i+1]");
+		}
+		@prior_clause = @rebuild_prior;
+		# Remove table aliases from prior clause
+		map { s/\s*PRIOR\s*//s; s/[^\s\.=<>!]+\.//s; } @prior_clause;
+	}
+	my $bkup_query = $str;
+	# Construct the initialization query
+	$str =~ s/(SELECT\s+)(.*?)(\s+FROM)/$1COLUMN_ALIAS$3/is;
+	my @columns = split(/\s*,\s*/, $2);
+	# When the pseudo column LEVEL is used in the where clause
+	# and not used in columns list, add the pseudo column
+	if ($where_clause =~ /\bLEVEL\b/is && !grep(/\bLEVEL\b/i, @columns)) {
+		push(@columns, 'level');
+	}
+	my @tabalias = ();
+	my %connect_by_path = ();
+	for (my $i = 0; $i <= $#columns; $i++) {
+		my $found = 0;
+		while ($columns[$i] =~ s/\%SUBQUERY(\d+)\%/$class->{sub_parts}{$1}/is) {
+			# Get out of here next run when a call to SYS_CONNECT_BY_PATH is found
+			# This will prevent opening too much subquery in the function parameters
+			last if ($found);
+			$found = 1 if ($columns[$i]=~ /SYS_CONNECT_BY_PATH/is);
+		};
+		# Replace LEVEL call by a counter, there is no direct equivalent in PostgreSQL
+		if (lc($columns[$i]) eq 'level') {
+			$columns[$i] = "1 as level";
+		} elsif ($columns[$i] =~ /\bLEVEL\b/is) {
+			$columns[$i] =~ s/\bLEVEL\b/1/is;
+		}
+		# Replace call to SYS_CONNECT_BY_PATH by the right concatenation string
+		if ($columns[$i] =~ s/SYS_CONNECT_BY_PATH\s*[\(]*\s*([^,]+),\s*([^\)]+)\s*\)/$1/is) {
+			my $col = $1;
+			$connect_by_path{$col}{sep} = $2;
+			# get the column alias
+			if ($columns[$i] =~ /\s+([^\s]+)\s*$/s) {
+				$connect_by_path{$col}{alias} = $1;
+			}
+		}
+		if ($columns[$i] =~ /([^\.]+)\./s) {
+			push(@tabalias, $1) if (!grep(/^\Q$1\E$/i, @tabalias));
+		}
+		extract_subpart($class, \$columns[$i]);
+
+		# Append parenthesis on new subqueries values
+		foreach my $z (sort {$a <=> $b } keys %{$class->{sub_parts}}) {
+			next if ($class->{sub_parts}{$z} =~ /^\(/);
+			# If subpart is not empty after transformation
+			if ($class->{sub_parts}{$z} =~ /\S/is) { 
+				# add open and closed parenthesis 
+				$class->{sub_parts}{$z} = '(' . $class->{sub_parts}{$z} . ')';
+			} elsif ($statements[$i] !~ /\s+(WHERE|AND|OR)\s*\%SUBQUERY$z\%/is) {
+				# otherwise do not report the empty parenthesis when this is not a function
+				$class->{sub_parts}{$z} = '(' . $class->{sub_parts}{$z} . ')';
+			}
+		}
+	}
+
+	# Extraction of the table aliases in the FROM clause
+	my $cols = join(',', @columns);
+	$str =~ s/COLUMN_ALIAS/$cols/s;
+	if ($str =~ s/(\s+FROM\s+)(.*)/$1FROM_CLAUSE/is) {
+		my $from_clause = $2;
+		$str =~ s/FROM_CLAUSE/$from_clause/;
+	}
+
+	# Now append the UNION ALL query that will be called recursively
+	$final_query .= $str;
+	$final_query .= ' WHERE ' . $start_with . "\n" if ($start_with);
+	#$where_clause =~ s/^\s*WHERE\s+/ AND /is;
+	#$final_query .= $where_clause . "\n";
+	$final_query .= "  UNION ALL\n";
+	if ($siblings && !$order_by) {
+		$final_query =~ s/(\s+FROM\s+)/,ARRAY[ row_number() OVER (ORDER BY $siblings) ] as hierarchy$1/is;
+	} elsif ($siblings) {
+
+		$final_query =~ s/(\s+FROM\s+)/,ARRAY[ row_number() OVER (ORDER BY $order_by) ] as hierarchy$1/is;
+	}
+	$bkup_query =~ s/(SELECT\s+)(.*?)(\s+FROM)/$1COLUMN_ALIAS$3/is;
+	@columns = split(/\s*,\s*/, $2);
+	# When the pseudo column LEVEL is used in the where clause
+	# and not used in columns list, add the pseudo column
+	if ($where_clause =~ /\bLEVEL\b/is && !grep(/\bLEVEL\b/i, @columns)) {
+		push(@columns, 'level');
+	}
+	for (my $i = 0; $i <= $#columns; $i++) {
+		my $found = 0;
+		while ($columns[$i] =~ s/\%SUBQUERY(\d+)\%/$class->{sub_parts}{$1}/is) {
+			# Get out of here when a call to SYS_CONNECT_BY_PATH is found
+			# This will prevent opening subquery in the function parameters
+			last if ($found);
+			$found = 1 if ($columns[$i]=~ /SYS_CONNECT_BY_PATH/is);
+		};
+		if ($columns[$i] =~ s/SYS_CONNECT_BY_PATH\s*[\(]*\s*([^,]+),\s*([^\)]+)\s*\)/$1/is) {
+			$columns[$i] = "c.$connect_by_path{$1}{alias} || $connect_by_path{$1}{sep} || " . $columns[$i];
+		}
+		if ($columns[$i] !~ s/\b[^\.]+\.LEVEL\b/(c.level+1)/igs) {
+			$columns[$i] =~ s/\bLEVEL\b/(c.level+1)/igs;
+		}
+		extract_subpart($class, \$columns[$i]);
+
+		# Append parenthesis on new subqueries values
+		foreach my $z (sort {$a <=> $b } keys %{$class->{sub_parts}}) {
+			next if ($class->{sub_parts}{$z} =~ /^\(/);
+			# If subpart is not empty after transformation
+			if ($class->{sub_parts}{$z} =~ /\S/is) { 
+				# add open and closed parenthesis 
+				$class->{sub_parts}{$z} = '(' . $class->{sub_parts}{$z} . ')';
+			} elsif ($statements[$i] !~ /\s+(WHERE|AND|OR)\s*\%SUBQUERY$z\%/is) {
+				# otherwise do not report the empty parenthesis when this is not a function
+				$class->{sub_parts}{$z} = '(' . $class->{sub_parts}{$z} . ')';
+			}
+		}
+	}
+	$cols = join(',', @columns);
+	$bkup_query =~ s/COLUMN_ALIAS/$cols/s;
+	my $prior_alias = '';
+	if ($bkup_query =~ s/(\s+FROM\s+)(.*)/$1FROM_CLAUSE/is) {
+		my $from_clause = $2;
+		if ($from_clause =~ /\b[^\s]+\s+(?:AS\s+)?([^\s]+)\b/) {
+			my $a = $1;
+			$prior_alias = "$a." if (!grep(/\b$a\.[^\s]+$/, @prior_clause));
+		}
+		$bkup_query =~ s/FROM_CLAUSE/$from_clause/;
+	}
+
+	# Remove last subquery alias in the from clause to put our own 
+	$bkup_query =~ s/(\%SUBQUERY\d+\%)\s+[^\s]+\s*$/$1/is;
+	if ($siblings && $order_by) {
+		$bkup_query =~ s/(\s+FROM\s+)/, array_append(c.hierarchy, row_number() OVER (ORDER BY $order_by))  as hierarchy$1/is;
+	} elsif ($siblings) {
+		$bkup_query =~ s/(\s+FROM\s+)/, array_append(c.hierarchy, row_number() OVER (ORDER BY $siblings))  as hierarchy$1/is;
+	}
+	$final_query .= $bkup_query;
+	map { s/^\s*(.*?)(=\s*)(.*)/c\.$1$2$prior_alias$3/s; } @prior_clause;
+	$final_query .= " JOIN cte c ON (" . join(' AND ', @prior_clause) . ")\n";
+	if ($siblings) {
+		$order_by = " ORDER BY hierarchy";
+	} elsif ($order_by) {
+		$order_by =~ s/^, //s;
+		$order_by = " ORDER BY $order_by";
+	}
+	$final_query .= "\n) SELECT * FROM cte$where_clause$union$group_by$order_by;\n";
+
+	return $final_query;
+}
+
+sub replace_without_function
+{
+	my ($class, $str) = @_;
+
+	# Code disabled because it break other complex GROUP BY clauses
+	# Keeping it just in case some light help me to solve this problem
+	# Reported in issue #496
+	# Remove text constant in GROUP BY clause, this is not allowed
+	# GROUP BY ?TEXTVALUE10?, %%REPLACEFCT1%%, DDI.LEGAL_ENTITY_ID
+	#if ($str =~ s/(\s+GROUP\s+BY\s+)(.*?)((?:(?=\bUNION\b|\bORDER\s+BY\b|\bLIMIT\b|\bINTO\s+|\bFOR\s+UPDATE\b|\bPROCEDURE\b).)+|$)/$1\%GROUPBY\% $3/is) {
+	#	my $tmp = $2;
+	#	$tmp =~ s/\?TEXTVALUE\d+\?[,]*\s*//gs;
+	#	$tmp =~ s/(\s*,\s*),\s*/$1/gs;
+	#	$tmp =~ s/\s*,\s*$//s;
+	#	$str =~ s/\%GROUPBY\%/$tmp/s;
+	#}
+
+	return $str;
+}
 
 1;
 
