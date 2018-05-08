@@ -9,7 +9,8 @@ use POSIX qw(locale_h);
 setlocale(LC_NUMERIC,"C");
 
 
-$VERSION = '18.1';
+$VERSION = '18.2';
+our @EXCLUDED_FUNCTION = ('SQUIRREL_GET_ERROR_OFFSET');
 
 # These definitions can be overriden from configuration file
 our %MYSQL_TYPE = (
@@ -49,6 +50,7 @@ our %MYSQL_TYPE = (
 	'YEAR' => 'smallint',
 	'MULTIPOLYGON' => 'geometry',
 	'BIT' => 'bit varying',
+	'UNSIGNED' => 'bigint'
 );
 
 sub _get_version
@@ -162,6 +164,13 @@ sub _table_info
 {
 	my $self = shift;
 
+	my %tbspname = ();
+	my $sth = $self->{dbh}->prepare("SELECT DISTINCT TABLE_NAME, TABLESPACE_NAME FROM INFORMATION_SCHEMA.FILES WHERE table_schema = '$self->{schema}' AND TABLE_NAME IS NOT NULL") or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0);
+	$sth->execute or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
+	while (my $r = $sth->fetch) {
+		$tbspname{$r->[0]} = $r->[1];
+	}
+	$sth->finish();
 	# Table: information_schema.tables
 	# TABLE_CATALOG   | varchar(512)        | NO   |     |         |       |
 	# TABLE_SCHEMA    | varchar(64)         | NO   |     |         |       |
@@ -187,9 +196,9 @@ sub _table_info
 
 	my %tables_infos = ();
 	my %comments = ();
-	my $sql = "SELECT TABLE_NAME,TABLE_COMMENT,TABLE_TYPE,TABLE_ROWS,ROUND( ( data_length + index_length) / 1024 / 1024, 2 ) AS \"Total Size Mb\", AUTO_INCREMENT FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE' AND TABLE_SCHEMA = '$self->{schema}'";
+	my $sql = "SELECT TABLE_NAME,TABLE_COMMENT,TABLE_TYPE,TABLE_ROWS,ROUND( ( data_length + index_length) / 1024 / 1024, 2 ) AS \"Total Size Mb\", AUTO_INCREMENT, ENGINE FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE' AND TABLE_SCHEMA = '$self->{schema}'";
 	$sql .= $self->limit_to_objects('TABLE', 'TABLE_NAME');
-	my $sth = $self->{dbh}->prepare( $sql ) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
+	$sth = $self->{dbh}->prepare( $sql ) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 	$sth->execute or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 	while (my $row = $sth->fetch) {
 		$row->[2] =~ s/^BASE //;
@@ -203,15 +212,11 @@ sub _table_info
 		$tables_infos{$row->[0]}{size} = $row->[4] || 0;
 		$tables_infos{$row->[0]}{tablespace} = 0;
 		$tables_infos{$row->[0]}{auto_increment} = $row->[5] || 0;
-		my $sth2 = $self->{dbh}->prepare("SELECT DISTINCT TABLESPACE_NAME FROM INFORMATION_SCHEMA.FILES WHERE TABLE_NAME = '$row->[0]' AND table_schema = '$self->{schema}'") or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0);
-		$sth2->execute or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
-		while (my $r = $sth2->fetch) {
-			$tables_infos{$row->[0]}{tablespace} = $r->[0];
-			last;
-		}
-		$sth2->finish();
+		$tables_infos{$row->[0]}{tablespace} = $tbspname{$row->[0]} || '';
+
 		# Get creation option unavailable in information_schema
-		$sth2 = $self->{dbh}->prepare("SHOW CREATE TABLE $row->[0]") or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0);
+		if ($row->[6] eq 'FEDERATED') {
+			my $sth2 = $self->{dbh}->prepare("SHOW CREATE TABLE $row->[0]") or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0);
 		$sth2->execute or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
 		while (my $r = $sth2->fetch) {
 			if ($r->[1] =~ /CONNECTION='([^']+)'/) {
@@ -220,6 +225,7 @@ sub _table_info
 			last;
 		}
 		$sth2->finish();
+		}
 	}
 	$sth->finish();
 
@@ -284,7 +290,7 @@ sub _column_info
 	# COLUMN_COMMENT           | varchar(1024)       | NO   |     |         |       |
 
 	my $sth = $self->{dbh}->prepare(<<END);
-SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, IS_NULLABLE, COLUMN_DEFAULT, NUMERIC_PRECISION, NUMERIC_SCALE, CHARACTER_OCTET_LENGTH, TABLE_NAME, '' AS OWNER, ORDINAL_POSITION, COLUMN_TYPE, EXTRA
+SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, IS_NULLABLE, COLUMN_DEFAULT, NUMERIC_PRECISION, NUMERIC_SCALE, CHARACTER_OCTET_LENGTH, TABLE_NAME, '' AS OWNER, '' AS VIRTUAL_COLUMN, ORDINAL_POSITION, EXTRA, COLUMN_TYPE
 FROM INFORMATION_SCHEMA.COLUMNS
 $condition
 ORDER BY ORDINAL_POSITION
@@ -297,10 +303,12 @@ END
 	my %data = ();
 	my $pos = 0;
 	while (my $row = $sth->fetch) {
-		$row->[2] = $row->[7] if $row->[1] =~ /char/i;
+		if ($row->[1] eq 'enum') {
+			$row->[1] = $row->[-1];
+		}
 		$row->[10] = $pos;
 		push(@{$data{"$row->[8]"}{"$row->[0]"}}, @$row);
-
+		pop(@{$data{"$row->[8]"}{"$row->[0]"}});
 		$pos++;
 	}
 
@@ -359,7 +367,7 @@ sub _get_indexes
 			# Save original column name
 			my $colname = $row->[4];
 			# Enclose with double quote if required
-			$row->[4] = $self->quote_reserved_words($row->[4]);
+			$row->[4] = $self->quote_object_name($row->[4]);
 
 			if ($self->{preserve_case}) {
 				if (($row->[4] !~ /".*"/) && ($row->[4] !~ /\(.*\)/)) {
@@ -499,6 +507,7 @@ sub _get_views
 	while (my $row = $sth->fetch) {
 		$row->[1] =~ s/`$self->{schema}`\.//g;
 		$row->[1] =~ s/`([^\s`,]+)`/$1/g;
+		$row->[1] =~ s/"/'/g;
 		$row->[1] =~ s/`/"/g;
 		$data{$row->[0]}{text} = $row->[1];
 		$data{$row->[0]}{owner} = '';
@@ -707,99 +716,182 @@ sub _get_functions
 
 sub _lookup_function
 {
-	my ($self, $fctname) = @_;
+	my ($self, $code, $fctname) = @_;
 
+	my $type = lc($self->{type}) . 's';
+	$code =~ s/"/'/g;
+	$code =~ s/`/"/g;
+	$code =~ s/\s+READS SQL DATA//igs;
+	$code =~ s/\s+UNSIGNED\b((?:.*?)\bFUNCTION\b)/$1/igs;
         my %fct_detail = ();
-	$fct_detail{name} = $fctname;
         $fct_detail{func_ret_type} = 'OPAQUE';
 
 	# Split data into declarative and code part
-	while ($self->{functions}{$fctname}{definition} =~ s/\s*DECLARE ([^;]+;)//im) {
-		$fct_detail{declare} .= "$1\n";
-	}
-	$fct_detail{code} = $self->{functions}{$fctname}{definition};
-	# Remove any label before the main block
-	$fct_detail{code} =~ s/^[^\s\:]+:\s*BEGIN/BEGIN/;
-	# Remove first BEGIN
-	$fct_detail{code} =~ s/BEGIN//;
-
+        ($fct_detail{declare}, $fct_detail{code}) = split(/\bBEGIN\b/i, $code, 2);
 	return if (!$fct_detail{code});
 
-	if ($self->{functions}{$fctname}{return}) {
-		$fct_detail{hasreturn} = 1;
-		$fct_detail{func_ret_type} = $self->_sql_type($self->{functions}{$fctname}{return});
+	$fct_detail{declare} =~ s/\s+[^\s\:]+:\s*$//gs;
+        @{$fct_detail{param_types}} = ();
+        if ( ($fct_detail{declare} =~ s/(.*?)\b(FUNCTION|PROCEDURE)\s+([^\s\(]+)\s*(\(.*\))\s+RETURNS\s+(.*)//is) ||
+        ($fct_detail{declare} =~ s/(.*?)\b(FUNCTION|PROCEDURE)\s+([^\s\(]+)\s*(\(.*\))//is) ) {
+                $fct_detail{before} = $1;
+                $fct_detail{type} = uc($2);
+                $fct_detail{name} = $3;
+                $fct_detail{args} = $4;
+		my $tmp_returned = $5;
+		chomp($tmp_returned);
+		if ($tmp_returned =~ s/\b(DECLARE\b.*)//is) {
+			$fct_detail{code} = $1 . $fct_detail{code};
 	}
-	$fct_detail{language} = $self->{functions}{$fctname}{language};
-	$fct_detail{immutable} = 1 if ($self->{functions}{$fctname}{immutable} eq 'YES');
-	$fct_detail{security} = $self->{functions}{$fctname}{security};
+		if ($fct_detail{declare} =~ s/\s*COMMENT\s+(\?TEXTVALUE\d+\?|'[^\']+')//) {
+			$fct_detail{comment} = $1;
+		}
+		$fct_detail{immutable} = 1 if ($fct_detail{declare} =~ s/\s*\bDETERMINISTIC\b//is);
+		$fct_detail{before} = ''; # There is only garbage for the moment
+	# Remove first BEGIN
+                $fct_detail{name} =~ s/['"]//g;
+                $fct_detail{fct_name} = $fct_detail{name};
+		if (!$fct_detail{args}) {
+			$fct_detail{args} = '()';
+		}
+		$fct_detail{immutable} = 1 if ($fct_detail{return} =~ s/\s*\bDETERMINISTIC\b//is);
+		$fct_detail{immutable} = 1 if ($tmp_returned =~ s/\s*\bDETERMINISTIC\b//is);
+
+		$fctname = $fct_detail{name} || $fctname;
+		if ($type eq 'functions' && exists $self->{$type}{$fctname}{return} && $self->{$type}{$fctname}{return}) {
+		$fct_detail{hasreturn} = 1;
+			$fct_detail{func_ret_type} = $self->_sql_type($self->{$type}{$fctname}{return});
+		} elsif ($type eq 'functions' && !exists $self->{$type}{$fctname}{return} && $tmp_returned) {
+			$tmp_returned =~ s/\s+CHARSET.*//is;
+			$fct_detail{func_ret_type} = $self->_sql_type($tmp_returned);
+			$fct_detail{hasreturn} = 1;
+	}
+		$fct_detail{language} = $self->{$type}{$fctname}{language};
+		$fct_detail{immutable} = 1 if ($self->{$type}{$fctname}{immutable} eq 'YES');
+		$fct_detail{security} = $self->{$type}{$fctname}{security};
 
 	# Extract arguments from the create statement
-	$self->{functions}{$fctname}{text} =~ /FUNCTION \`$fctname\`(\(.*?\)) RETURNS/i;
-	$fct_detail{args} = $1 || '';
+		if ($type eq 'procedures' && $fct_detail{args} =~ /\b(OUT|INOUT)\b/) {
+			$fct_detail{func_ret_type} = ' ';
+		}
+		$fct_detail{args} =~ s/\bIN\s+OUT/INOUT/igs;
 
-	if ($self->{functions}{$fctname}{text} =~ /RETURNS (.*?) CHARSET/) {
-		$fct_detail{func_ret_type} = $self->_sql_type($1);
+		$fct_detail{declare} = '';
+		while ($fct_detail{code} =~ s/DECLARE\s+([^;]+;)//is) {
+				$fct_detail{declare} .= "\n$1";
 	}
 
 	# Now convert types
-	$fct_detail{args} = replace_sql_type($fct_detail{args}, $self->{pg_numeric_type}, $self->{default_numeric}, $self->{pg_integer_type});
-	$fct_detail{declare} = replace_sql_type($fct_detail{declare}, $self->{pg_numeric_type}, $self->{default_numeric}, $self->{pg_integer_type});
-
+		if ($fct_detail{args}) {
+			$fct_detail{args} = replace_sql_type($fct_detail{args}, $self->{pg_numeric_type}, $self->{default_numeric}, $self->{pg_integer_type}, %{ $self->{data_type} });
+		}
+		if ($fct_detail{declare}) {
+			$fct_detail{declare} = replace_sql_type($fct_detail{declare}, $self->{pg_numeric_type}, $self->{default_numeric}, $self->{pg_integer_type}, %{ $self->{data_type} });
+		}
 	# Replace PL/SQL code into PL/PGSQL similar code
-	$fct_detail{declare} = Ora2Pg::PLSQL::mysql_to_plpgsql($self, $fct_detail{declare});
-	if ($fct_detail{code}) {
-		$fct_detail{code} = Ora2Pg::PLSQL::mysql_to_plpgsql($self, "BEGIN".$fct_detail{code});
+		$fct_detail{args} =~ s/\s+/ /gs;
+		push(@{$fct_detail{param_types}}, split(/\s*,\s*/, $fct_detail{args}));
+		map { s/^\(//; } @{$fct_detail{param_types}};
+		map { s/\)$//; } @{$fct_detail{param_types}};
+		map { s/\%ORA2PG_COMMENT\d+\%//gs; }  @{$fct_detail{param_types}};
+		map { s/^\s*[^\s]+\s+(IN|OUT|INOUT)/$1/i; s/^((?:IN|OUT|INOUT)\s+[^\s]+)\s+[^\s]*$/$1/i; s/\(.*//; s/\s*\)\s*$//; s/\s+$//; } @{$fct_detail{param_types}};
+
+	} else {
+                delete $fct_detail{func_ret_type};
+                delete $fct_detail{declare};
+                $fct_detail{code} = $code;
 	}
 
+	my @nout = $fct_detail{args} =~ /\bOUT\s+([^,\)]+)/igs;
+	my @ninout = $fct_detail{args} =~ /\bINOUT\s+([^,\)]+)/igs;
+	my $nbout = $#nout+1 + $#ninout+1;
+	$fct_detail{inout} = 1 if ($nbout > 0);
+	($fct_detail{code}, $fct_detail{declare}) = replace_mysql_variables($self, $fct_detail{code}, $fct_detail{declare});
 	return %fct_detail;
 }
 
-sub _lookup_procedure
+sub replace_mysql_variables
 {
-	my ($self, $fctname) = @_;
+	my ($self, $code, $declare) = @_;
 
-        my %fct_detail = ();
-	$fct_detail{name} = $fctname;
-        $fct_detail{func_ret_type} = 'OPAQUE';
-
-	# Split data into declarative and code part
-	while ($self->{procedures}{$fctname}{definition} =~ s/\s*DECLARE\s+([^;]+;)//is) {
-		$fct_detail{declare} .= "$1\n";
+	while ($code =~ s/\b(?:SET\s+)?\@\@(?:SESSION\.)?([^\s:=]+)\s*:=\s*([^;]+);/PERFORM set_config('$1', $2, false);/is) {
+		my $n = $1;
+		my $v = $2;
+		$self->{global_variables}{$n}{name} = lc($n);
+		$self->{global_variables}{$n}{type} = 'bigint';
+		if ($v =~ /'[^\']*'/) {
+			$self->{global_variables}{$n}{type} = 'varchar';
+		}
+		if ($n =~ /datetime/i) {
+			$self->{global_variables}{$n}{type} = 'timestamp';
+		} elsif ($n =~ /time/i) {
+			$self->{global_variables}{$n}{type} = 'time';
+		} elsif ($n =~ /date/i) {
+			$self->{global_variables}{$n}{type} = 'date';
+		} 
 	}
-	$fct_detail{code} = $self->{procedures}{$fctname}{definition};
+
+	my @to_be_replaced = ();
+	# Split data into declarative and code part
+	while ($code =~ s/SET\s+\@([^\s:]+)\s*:=\s*([^;]+);/SET $1 = $2;/is) {
+		my $n = $1;
+		my $v = $2;
+		my $type = 'integer';
+		$type = 'varchar' if ($v =~ /'[^']*'/);
+		if ($n =~ /datetime/i) {
+			$type = 'timestamp';
+		} elsif ($n =~ /time/i) {
+			$type = 'time';
+		} elsif ($n =~ /date/i) {
+			$type = 'date';
+		} 
+		$declare .= "$n $type;\n" if ($declare !~ /\b$n $type;/s);
+		push(@to_be_replaced, $n);
+	}
+
+	while ($code =~ s/(\s+)\@([^\s:=]+)\s*:=\s*([^;]+);/$1$2 := $3;/is) {
+		my $n = $2;
+		my $v = $3;
 	# Remove any label before the main block
-	$fct_detail{code} =~ s/^[^\s\:]+:\s*BEGIN/BEGIN/;
-	# Remove first BEGIN
-	$fct_detail{code} =~ s/^BEGIN//;
-
-	return if (!$fct_detail{code});
-
-	$fct_detail{language} = $self->{procedures}{$fctname}{language};
-	$fct_detail{immutable} = 1 if ($self->{procedures}{$fctname}{immutable} eq 'YES');
-	$fct_detail{security} = $self->{procedures}{$fctname}{security};
+		my $type = 'integer';
+		$type = 'varchar' if ($v =~ /'[^']*'/);
+		if ($n =~ /datetime/i) {
+			$type = 'timestamp';
+		} elsif ($n =~ /time/i) {
+			$type = 'time';
+		} elsif ($n =~ /date/i) {
+			$type = 'date';
+		} 
+		$declare .= "$n $type;\n" if ($declare !~ /\b$n $type;/s);
+		push(@to_be_replaced, $n);
+	}
 
 	# Extract arguments from the create statement
-	$self->{procedures}{$fctname}{text} =~ /PROCEDURE \`$fctname\`(\(.*?)BEGIN/is;
-	$fct_detail{args} = $1 || '';
-	$fct_detail{args} =~ s/\)[^\)]+$/\)/;
+	foreach my $n (@to_be_replaced) {
+		$code =~ s/\@$n\b(\s*[^:])/$n$1/gs;
+	}
 
+	while ($code =~ s/\@([a-z0-9_]+)/$1/is) {
+		my $n = $1;
 	# Procedure that have out parameters are functions with PG
-	if ($fct_detail{args} =~ /\b(OUT|INOUT)\b/) {
+		my $type = 'varchar';
+		if ($n =~ /datetime/i) {
+			$type = 'timestamp';
+		} elsif ($n =~ /time/i) {
+			$type = 'time';
+		} elsif ($n =~ /date/i) {
 		# set return type to empty to avoid returning void later
-		$fct_detail{func_ret_type} = ' ';
+			$type = 'date';
 	}
-
+		$declare .= "$n $type;\n" if ($declare !~ /\b$n $type;/s);
 	# Now convert types
-	$fct_detail{args} = replace_sql_type($fct_detail{args}, $self->{pg_numeric_type}, $self->{default_numeric}, $self->{pg_integer_type});
-	$fct_detail{declare} = replace_sql_type($fct_detail{declare}, $self->{pg_numeric_type}, $self->{default_numeric}, $self->{pg_integer_type});
-
+		$code =~ s/\@$n\b/$n/gs;
 	# Replace PL/SQL code into PL/PGSQL similar code
-	$fct_detail{declare} = Ora2Pg::PLSQL::mysql_to_plpgsql($self, $fct_detail{declare});
-	if ($fct_detail{code}) {
-		$fct_detail{code} = Ora2Pg::PLSQL::mysql_to_plpgsql($self, "BEGIN".$fct_detail{code});
 	}
 
-	return %fct_detail;
+	$code =~ s/\bSET\s+([^\s=]+)\s*=\s*([^;]+\bSELECT\b[^;]+);/$1 = $2;/igs;
+
+	return ($code, $declare);
 }
 
 sub _list_all_funtions
@@ -839,30 +931,39 @@ sub _sql_type
 	my $data_type = '';
 	
 	# Simplify timestamp type
-	$type =~ s/TIMESTAMP\(\d+\)/TIMESTAMP/i;
-	$type =~ s/TIME\(\d+\)/TIME/i;
-	$type =~ s/DATE\(\d+\)/DATE/i;
+	$type =~ s/TIMESTAMP\s*\(\s*\d+\s*\)/TIMESTAMP/i;
+	$type =~ s/TIME\s*\(\s*\d+\s*\)/TIME/i;
+	$type =~ s/DATE\s*\(\s*\d+\s*\)/DATE/i;
 	# Remove BINARY from CHAR(n) BINARY, TEXT(n) BINARY, VARCHAR(n) BINARY ...
-	$type =~ s/(CHAR|TEXT)(\(\d+\)) BINARY/$1$2/i;
-	$type =~ s/(CHAR|TEXT) BINARY/$1/i;
+	$type =~ s/(CHAR|TEXT)\s*(\(\s*\d+\s*\)) BINARY/$1$2/i;
+	$type =~ s/(CHAR|TEXT)\s+BINARY/$1/i;
 
+	if ($type =~ s/\(\s*(\d+)\s*\)//) {
+		$len   = $1;
+	} elsif ($type =~ s/\(\s*(\d+)\s*,\s*(\d+)\s*\)//) {
+		$len   = $1;
+		$scale = $2;
+	}
+	if ($type !~ /CHAR/i) {
+		$precision = $len if (!$precision);
+	}
         # Overide the length
         $len = $precision if ( ((uc($type) eq 'NUMBER') || (uc($type) eq 'BIT')) && $precision );
-        if (exists $MYSQL_TYPE{uc($type)}) {
+        if (exists $self->{data_type}{uc($type)}) {
 		$type = uc($type); # Force uppercase
 		if ($len) {
 			if ( ($type eq "CHAR") || ($type =~ /VARCHAR/) ) {
 				# Type CHAR have default length set to 1
 				# Type VARCHAR(2) must have a specified length
 				$len = 1 if (!$len && ($type eq "CHAR"));
-                		return "$MYSQL_TYPE{$type}($len)";
+                		return "$self->{data_type}{$type}($len)";
 			} elsif ($type eq 'BIT') {
 				if ($precision) {
-					return "$MYSQL_TYPE{$type}($precision)";
+					return "$self->{data_type}{$type}($precision)";
 				} else {
-					return $MYSQL_TYPE{$type};
+					return $self->{data_type}{$type};
 				}
-			} elsif ($type =~ /^(TINYINT|SMALLINT|MEDIUMINT|INTEGER|BIGINT|INT|REAL|DOUBLE|FLOAT|DECIMAL|NUMERIC)$/i) {
+			} elsif ($type =~ /(TINYINT|SMALLINT|MEDIUMINT|INTEGER|BIGINT|INT|REAL|DOUBLE|FLOAT|DECIMAL|NUMERIC)/i) {
 				# This is an integer
 				if (!$scale) {
 					if ($precision) {
@@ -878,11 +979,11 @@ sub _sql_type
 						return "numeric($precision)";
 					} else {
 						# Most of the time interger should be enought?
-						return $MYSQL_TYPE{$type};
+						return $self->{data_type}{$type};
 					}
 				} else {
 					if ($precision) {
-						if ($self->{pg_numeric_type}) {
+						if ($type !~ /DOUBLE/ && $self->{pg_numeric_type}) {
 							if ($precision <= 6) {
 								return 'real';
 							} else {
@@ -893,9 +994,9 @@ sub _sql_type
 					}
 				}
 			}
-			return $MYSQL_TYPE{$type};
+			return $self->{data_type}{$type};
 		} else {
-			return $MYSQL_TYPE{$type};
+			return $self->{data_type}{$type};
 		}
         }
 
@@ -904,19 +1005,24 @@ sub _sql_type
 
 sub replace_sql_type
 {
-        my ($str, $pg_numeric_type, $default_numeric, $pg_integer_type) = @_;
+        my ($str, $pg_numeric_type, $default_numeric, $pg_integer_type, %data_type) = @_;
 
 	$str =~ s/with local time zone/with time zone/igs;
 	$str =~ s/([A-Z])ORA2PG_COMMENT/$1 ORA2PG_COMMENT/igs;
 
 	# Remove any reference to UNSIGNED AND ZEROFILL
+	$str =~ s/(\s+AS\s+)UNSIGNED/$1$data_type{'UNSIGNED'}/gis;
 	$str =~ s/\b(UNSIGNED|ZEROFILL)\b//gis;
 	# Remove BINARY from CHAR(n) BINARY and VARCHAR(n) BINARY
-	$str =~ s/(CHAR|TEXT)(\(\d+\)) BINARY/$1$2/gis;
-	$str =~ s/(CHAR|TEXT) BINARY/$1/gis;
+	$str =~ s/(CHAR|TEXT)\s*(\(\s*\d+\s*\))\s+BINARY/$1$2/gis;
+	$str =~ s/(CHAR|TEXT)\s+BINARY/$1/gis;
 
 	# Replace type with precision
-	my $mysqltype_regex = join('|', keys %MYSQL_TYPE);
+	my $mysqltype_regex = '';
+	foreach (keys %data_type) {
+		$mysqltype_regex .= quotemeta($_) . '|';
+	}
+	$mysqltype_regex =~ s/\|$//;
 	while ($str =~ /(.*)\b($mysqltype_regex)\s*\(([^\)]+)\)/i) {
 		my $backstr = $1;
 		my $type = uc($2);
@@ -925,6 +1031,10 @@ sub replace_sql_type
 			# Prevent from infinit loop
 			$str =~ s/\(/\%\|/s;
 			$str =~ s/\)/\%\|\%/s;
+			next;
+		}
+		if (exists $data_type{"$type($args)"}) {
+			$str =~ s/\b$type\($args\)/$data_type{"$type($args)"}/igs;
 			next;
 		}
 		if ($backstr =~ /_$/) {
@@ -940,12 +1050,30 @@ sub replace_sql_type
 			# Type CHAR have default length set to 1
 			# Type VARCHAR must have a specified length
 			$len = 1 if (!$len && ($type eq "CHAR"));
-			$str =~ s/\b$type\b\s*\([^\)]+\)/$MYSQL_TYPE{$type}\%\|$len\%\|\%/is;
+			$str =~ s/\b$type\b\s*\([^\)]+\)/$data_type{$type}\%\|$len\%\|\%/is;
 		} elsif ($precision && ($type =~ /(BIT|TINYINT|SMALLINT|MEDIUMINT|INTEGER|BIGINT|INT|REAL|DOUBLE|FLOAT|DECIMAL|NUMERIC)/)) {
 			if (!$scale) {
-				$str =~ s/\b$type\b\s*\([^\)]+\)/$MYSQL_TYPE{$type}\%\|$precision\%\|\%/is;
+				if ($type =~ /(BIT|TINYINT|SMALLINT|MEDIUMINT|INTEGER|BIGINT|INT)/) {
+					if ($pg_integer_type) {
+						if ($precision < 5) {
+							$str =~ s/\b$type\b\s*\([^\)]+\)/smallint/is;
+						} elsif ($precision <= 9) {
+							$str =~ s/\b$type\b\s*\([^\)]+\)/integer/is;
+						} else {
+							$str =~ s/\b$type\b\s*\([^\)]+\)/bigint/is;
+						}
+					} else {
+						$str =~ s/\b$type\b\s*\([^\)]+\)/numeric\%\|$precision\%\|\%/i;
+					}
+				} else {
+					$str =~ s/\b$type\b\s*\([^\)]+\)/$data_type{$type}\%\|$precision\%\|\%/is;
+				}
 			} else {
-				$str =~ s/\b$type\b\s*\([^\)]+\)/$MYSQL_TYPE{$type}\%\|$args\%\|\%/is;
+				if ($type =~ /DOUBLE/) {
+					$str =~ s/\b$type\b\s*\([^\)]+\)/decimal\%\|$args\%\|\%/is;
+				} else {
+					$str =~ s/\b$type\b\s*\([^\)]+\)/$data_type{$type}\%\|$args\%\|\%/is;
+				}
 			}
 		} else {
 			# Prevent from infinit loop
@@ -959,11 +1087,11 @@ sub replace_sql_type
 	# Replace datatype even without precision
 	my %recover_type = ();
 	my $i = 0;
-	foreach my $type (sort { length($b) <=> length($a) } keys %MYSQL_TYPE) {
+	foreach my $type (sort { length($b) <=> length($a) } keys %data_type) {
 		# Keep enum as declared, we are not in table definition
 		next if (uc($type) eq 'ENUM');
 		while ($str =~ s/\b$type\b/%%RECOVER_TYPE$i%%/is) {
-			$recover_type{$i} = $MYSQL_TYPE{$type};
+			$recover_type{$i} = $data_type{$type};
 			$i++;
 		}
 	}
@@ -1585,5 +1713,132 @@ sub _list_triggers
 	return %triggers;
 }
 
+sub _global_temp_table_info
+{
+        my($self) = @_;
+	return;
+}
+sub _encrypted_columns
+{
+        my($self) = @_;
+	return;
+}
+sub _get_subpartitioned_table
+{
+        my($self) = @_;
+	return;
+}
+sub replace_if
+{
+	my $str = shift;
+	my %in_clauses = ();
+	my $j = 0;
+	while ($str =~ s/\b(IN\s*\([^\(\)]+\))/,\%INCLAUSE$j\%/is) {
+		$in_clauses{$j} = $1;
+		$j++;
+	}
+	while ($str =~ s/\bIF\s*\(((?:(?!\)\s*THEN|\bIF\s*\().)*)$/\%IF\%$2/is || $str =~ s/\bIF\s*\(([^\(\)]+)\)(\s+AS\s+)/(\%IF\%)$2/is) {
+		my @if_params = ('');
+		my $stop_learning = 0;
+		my $idx = 1;
+		foreach my $c (split(//, $1)) {
+			$idx++ if (!$stop_learning && $c eq '(');
+			$idx-- if (!$stop_learning && $c eq ')');
+			if ($idx == 0) {
+				$c = '' if (!$stop_learning);
+				$stop_learning = 1;
+				$str .= $c;
+			} elsif ($idx > 0) {
+				if ($c eq ',' && ($idx - 1) == 0) {
+					push(@if_params, '');
+				} elsif ($c ne "\n") {
+					$if_params[-1] .= $c;
+				}
+			}
+		}
+		my $case_str = 'CASE ';
+		for (my $i = 1; $i <= $#if_params; $i+=2) {
+			$if_params[$i] =~ s/^\s+//gs;
+			$if_params[$i] =~ s/\s+$//gs;
+			if ($i < $#if_params) {
+				if ($if_params[$i] !~ /INCLAUSE/) {
+					$case_str .= "WHEN $if_params[0] THEN $if_params[$i] ELSE $if_params[$i+1] ";
+				} else {
+					$case_str .= "WHEN $if_params[0] $if_params[$i] THEN $if_params[$i+1] ";
+				}
+			} else {
+				$case_str .= " ELSE $if_params[$i] ";
+			}
+		}
+		$case_str .= 'END ';
+		$str =~ s/\%IF\%/$case_str/s;
+	}
+	$str =~ s/\%INCLAUSE(\d+)\%/$in_clauses{$1}/gs;
+	$str =~ s/\s*,\s*IN\s*\(/ IN \(/igs;
+	return $str;
+}
+sub _get_plsql_metadata
+{
+        my $self = shift;
+        my $owner = shift;
+	my $str = "SELECT ROUTINE_NAME,ROUTINE_SCHEMA,ROUTINE_TYPE,ROUTINE_DEFINITION FROM INFORMATION_SCHEMA.ROUTINES";
+	if ($self->{schema}) {
+		$str .= " WHERE ROUTINE_SCHEMA = '$self->{schema}'";
+	}
+	$str .= " ORDER BY ROUTINE_NAME";
+	my $sth = $self->{dbh}->prepare($str) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
+	$sth->execute or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
+	my %functions = ();
+	my @fct_done = ();
+	push(@fct_done, @EXCLUDED_FUNCTION);
+	while (my $row = $sth->fetch) {
+		next if (grep(/^$row->[0]$/i, @fct_done));
+		push(@fct_done, "$row->[0]");
+		$self->{function_metadata}{'unknown'}{'none'}{$row->[0]}{type} = $row->[2];
+		$self->{function_metadata}{'unknown'}{'none'}{$row->[0]}{text} = $row->[3];
+		my $sth2 = $self->{dbh}->prepare("SHOW CREATE $row->[2] $row->[0]") or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
+		$sth2->execute or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
+		while (my $r = $sth2->fetch) {
+			$self->{function_metadata}{'unknown'}{'none'}{$row->[0]}{text} = $r->[2];
+			last;
+		}
+		$sth2->finish();
+	}
+	$sth->finish();
+	foreach my $name (sort keys %{$self->{function_metadata}{'unknown'}{'none'}}) {
+		$self->_remove_comments(\$self->{function_metadata}{'unknown'}{'none'}{$name}{text}, 1);
+		$self->{comment_values} = ();
+		$self->{function_metadata}{'unknown'}{'none'}{$name}{text} =~ s/\%ORA2PG_COMMENT\d+\%//gs;
+		my %fct_detail = $self->_lookup_function($self->{function_metadata}{'unknown'}{'none'}{$name}{text}, $name);
+		if (!exists $fct_detail{name}) {
+			delete $self->{function_metadata}{'unknown'}{'none'}{$name};
+			next;
+		}
+		delete $fct_detail{code};
+		delete $fct_detail{before};
+		%{$self->{function_metadata}{'unknown'}{'none'}{$name}{metadata}} = %fct_detail;
+		delete $self->{function_metadata}{'unknown'}{'none'}{$name}{text};
+	}
+}
+sub _get_security_definer
+{
+	my ($self, $type) = @_;
+	my %security = ();
+	my $str = "SELECT ROUTINE_NAME,ROUTINE_SCHEMA,SECURITY_TYPE,DEFINER FROM INFORMATION_SCHEMA.ROUTINES";
+	if ($self->{schema}) {
+		$str .= " WHERE ROUTINE_SCHEMA = '$self->{schema}'";
+	}
+	$str .= " " . $self->limit_to_objects('FUNCTION|PROCEDURE', 'ROUTINE_NAME|ROUTINE_NAME');
+	$str .= " ORDER BY ROUTINE_NAME";
+	my $sth = $self->{dbh}->prepare($str) or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
+	$sth->execute or $self->logit("FATAL: " . $self->{dbh}->errstr . "\n", 0, 1);
+	while (my $row = $sth->fetch) {
+		next if (!$row->[0]);
+		$security{$row->[0]}{security} = $row->[2];
+		$security{$row->[0]}{owner} = $row->[3];
+	}
+	$sth->finish();
+	return (\%security);
+}
 1;
 
